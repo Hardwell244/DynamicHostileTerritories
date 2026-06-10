@@ -32,33 +32,41 @@ namespace DynamicHostileTerritories.Core
         public override void Initialize()
         {
             _settings = PluginSettings.Load();
+            Logger.Initialize(_settings.DebugLogging);
+            Logger.Info("Dynamic Hostile Territories initializing. DebugLogging=" + _settings.DebugLogging + ".");
 
             if (!_settings.Enabled)
             {
-                Game.LogTrivial("[DHT] Plugin is disabled in the configuration. Not starting.");
+                Logger.Info("Plugin is disabled in the configuration. Not starting.");
                 return;
             }
 
-            // Build the service graph. Nothing here touches the game world yet.
-            _repository = new TerritoryRepository();
-            _stateStore = new TerritoryStateStore();
-            _stateStore.Apply(_repository.Territories);
+            try
+            {
+                _repository = new TerritoryRepository();
+                _stateStore = new TerritoryStateStore();
+                _stateStore.Apply(_repository.Territories);
 
-            _hostility = new HostilityCalculator();
-            _spawnManager = new GangSpawnManager(_settings.MaxSpawnedPeds);
-            _director = new EncounterDirector(_settings, _hostility, _spawnManager);
-            _controller = new TerritoryController(_settings, _repository, _director, _spawnManager, _stateStore);
-            _menu = new InteractionMenu(_settings, _controller, _repository);
+                _hostility = new HostilityCalculator(_settings);
+                _spawnManager = new GangSpawnManager(_settings.MaxSpawnedPeds);
+                _director = new EncounterDirector(_settings, _hostility, _spawnManager);
+                _controller = new TerritoryController(_settings, _repository, _director, _spawnManager, _stateStore);
+                _menu = new InteractionMenu(_settings, _controller, _repository);
 
-            Functions.OnOnDutyStateChanged += OnOnDutyStateChanged;
-            Game.LogTrivial("[DHT] Dynamic Hostile Territories loaded. Waiting for on-duty.");
+                Functions.OnOnDutyStateChanged += OnOnDutyStateChanged;
+                Logger.Info("Loaded with " + _repository.Territories.Count + " territories. Waiting for on-duty.");
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("Initialization failed", ex);
+            }
         }
 
         public override void Finally()
         {
             Functions.OnOnDutyStateChanged -= OnOnDutyStateChanged;
             Shutdown();
-            Game.LogTrivial("[DHT] Dynamic Hostile Territories unloaded.");
+            Logger.Info("Dynamic Hostile Territories unloaded.");
         }
 
         private void OnOnDutyStateChanged(bool onDuty)
@@ -71,7 +79,7 @@ namespace DynamicHostileTerritories.Core
 
         private void Startup()
         {
-            if (_onDuty || _settings == null || !_settings.Enabled)
+            if (_onDuty || _settings == null || !_settings.Enabled || _controller == null)
                 return;
 
             _onDuty = true;
@@ -79,12 +87,9 @@ namespace DynamicHostileTerritories.Core
             _inputFiber = GameFiber.StartNew(InputLoop);
             GameFiber.StartNew(ShowWelcomeNotification);
 
-            Game.LogTrivial("[DHT] Player went on duty. Systems online.");
+            Logger.Info("Player went on duty. Systems online.");
         }
 
-        /// <summary>
-        /// Idempotent teardown: safe to call on off-duty and again on unload.
-        /// </summary>
         private void Shutdown()
         {
             _onDuty = false;
@@ -107,7 +112,7 @@ namespace DynamicHostileTerritories.Core
                 }
                 catch (Exception ex)
                 {
-                    Game.LogTrivial("[DHT] Menu loop error: " + ex);
+                    Logger.Error("Menu loop error", ex);
                 }
 
                 GameFiber.Yield();
@@ -138,7 +143,7 @@ namespace DynamicHostileTerritories.Core
             }
             catch (Exception ex)
             {
-                Game.LogTrivial("[DHT] Failed to display welcome notification: " + ex);
+                Logger.Error("Failed to display welcome notification", ex);
             }
         }
     }

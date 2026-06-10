@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using DynamicHostileTerritories.Core;
 using DynamicHostileTerritories.Data;
 using Rage;
 using Rage.Native;
@@ -21,6 +22,7 @@ namespace DynamicHostileTerritories.Services
         private readonly List<Vehicle> _vehicles = new List<Vehicle>();
 
         private RelationshipGroup _gangGroup;
+        private bool _hasGangGroup; // RelationshipGroup is a struct (can't be null), so track this explicitly
         private bool _isActive;
 
         public IReadOnlyList<Ped> SpawnedPeds => _peds;
@@ -42,18 +44,23 @@ namespace DynamicHostileTerritories.Services
 
             if (tier == HostilityLevel.Pacified || _maxPeds <= 0)
             {
+                _hasGangGroup = false;
                 _isActive = true; // active but intentionally empty
+                Logger.Debug("Activated " + territory.Name + " with no peds (tier " + tier + ").");
                 return;
             }
 
             _gangGroup = new RelationshipGroup("DHT_" + territory.ControllingGang.Name);
+            _hasGangGroup = true;
 
             int desired = Math.Min(PedCountFor(tier), _maxPeds);
             string weapon = WeaponFor(tier);
 
+            int spawned = 0;
             for (int i = 0; i < desired; i++)
             {
-                SpawnGangMember(territory, weapon);
+                if (SpawnGangMember(territory, weapon))
+                    spawned++;
                 GameFiber.Sleep(150); // stagger to spread the load
             }
 
@@ -61,10 +68,15 @@ namespace DynamicHostileTerritories.Services
                 SpawnGangVehicle(territory);
 
             _isActive = true;
+            Logger.Info("Activated " + territory.Name + " (" + territory.ControllingGang.Name
+                + ", tier " + tier + "): " + spawned + "/" + desired + " peds, weapon " + weapon + ".");
         }
 
         public void Deactivate()
         {
+            int peds = _peds.Count;
+            int vehicles = _vehicles.Count;
+
             foreach (Ped ped in _peds)
                 if (ped.Exists()) ped.Delete();
             _peds.Clear();
@@ -73,8 +85,11 @@ namespace DynamicHostileTerritories.Services
                 if (vehicle.Exists()) vehicle.Delete();
             _vehicles.Clear();
 
-            _gangGroup = null;
+            _hasGangGroup = false;
             _isActive = false;
+
+            if (peds > 0 || vehicles > 0)
+                Logger.Debug("Deactivated and cleaned up " + peds + " peds, " + vehicles + " vehicles.");
         }
 
         /// <summary>
@@ -83,7 +98,7 @@ namespace DynamicHostileTerritories.Services
         /// </summary>
         public void ApplyPosture(EncounterState state, HostilityLevel tier)
         {
-            if (_gangGroup == null)
+            if (!_hasGangGroup)
                 return;
 
             ApplyRelationship(state);
@@ -98,55 +113,64 @@ namespace DynamicHostileTerritories.Services
                 switch (state)
                 {
                     case EncounterState.Observing:
-                        // They notice and keep an eye on you, nothing more.
                         ped.BlockPermanentEvents = true;
                         NativeFunction.Natives.TASK_TURN_PED_TO_FACE_ENTITY(ped, player, 3000);
                         break;
 
                     case EncounterState.Suspicious:
-                        // They shadow the player at ~8m.
                         ped.BlockPermanentEvents = true;
                         NativeFunction.Natives.TASK_FOLLOW_TO_OFFSET_OF_ENTITY(
                             ped, player, 0f, 0f, 0f, 1.5f, -1, 8f, true);
                         break;
 
                     case EncounterState.Provoked:
-                        // Weapons up, hold the area, defend — do not charge.
                         ped.BlockPermanentEvents = false;
                         NativeFunction.Natives.TASK_GUARD_CURRENT_POSITION(ped, 15f, 15f, true);
                         break;
 
                     case EncounterState.War:
-                        // Fight from cover instead of rushing in.
                         ped.BlockPermanentEvents = false;
                         ped.Tasks.TakeCoverAt(ped.Position, player.Position, -1, true);
                         break;
                 }
             }
+
+            Logger.Debug("Applied posture " + state + " to " + _peds.Count + " peds.");
         }
 
-        private void SpawnGangMember(Territory territory, string weapon)
+        private bool SpawnGangMember(Territory territory, string weapon)
         {
             string model = Pick(territory.ControllingGang.PedModels);
             Vector3 around = RandomPointAround(territory.Center, territory.Radius * 0.6f);
 
-            // Snap to a valid pedestrian position so we never spawn inside a fence/object.
             Vector3 spawnPos = around;
             if (NativeFunction.Natives.GET_SAFE_COORD_FOR_PED<bool>(around.X, around.Y, around.Z, true, out Vector3 safe, 0))
                 spawnPos = safe;
 
             float heading = _rng.Next(0, 360);
 
-            Ped ped = new Ped(model, spawnPos, heading);
+            Ped ped;
+            try
+            {
+                ped = new Ped(model, spawnPos, heading);
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn("Failed to spawn ped model '" + model + "': " + ex.Message);
+                return false;
+            }
+
             if (!ped.Exists())
-                return;
+            {
+                Logger.Warn("Ped model '" + model + "' did not materialise (invalid model?).");
+                return false;
+            }
 
             ped.IsPersistent = true;
             ped.RelationshipGroup = _gangGroup;
-            // Weapon stays holstered until a hostile posture makes them draw it.
-            ped.Inventory.GiveNewWeapon(weapon, -1, false);
-
+            ped.Inventory.GiveNewWeapon(weapon, -1, false); // holstered until a hostile posture
             _peds.Add(ped);
+            return true;
         }
 
         private void SpawnGangVehicle(Territory territory)
@@ -154,18 +178,28 @@ namespace DynamicHostileTerritories.Services
             string model = Pick(territory.ControllingGang.VehicleModels);
             Vector3 pos = World.GetNextPositionOnStreet(RandomPointAround(territory.Center, territory.Radius * 0.5f));
 
-            Vehicle vehicle = new Vehicle(model, pos);
-            if (!vehicle.Exists())
-                return;
+            try
+            {
+                Vehicle vehicle = new Vehicle(model, pos);
+                if (!vehicle.Exists())
+                {
+                    Logger.Warn("Vehicle model '" + model + "' did not materialise.");
+                    return;
+                }
 
-            vehicle.IsPersistent = true;
-            _vehicles.Add(vehicle);
+                vehicle.IsPersistent = true;
+                _vehicles.Add(vehicle);
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn("Failed to spawn vehicle model '" + model + "': " + ex.Message);
+            }
         }
 
         private void ApplyRelationship(EncounterState state)
         {
             RelationshipGroup player = Game.LocalPlayer.Character.RelationshipGroup;
-            RelationshipGroup cops = new RelationshipGroup("COP");
+            RelationshipGroup cops = RelationshipGroup.Cop;
 
             Relationship rel;
             switch (state)
@@ -175,7 +209,7 @@ namespace DynamicHostileTerritories.Services
                 default: rel = Relationship.Neutral; break;
             }
 
-            // The gang's stance toward the player AND the police (fixes them ignoring your partner/backup).
+            // Gang's stance toward player AND police (so they engage your partner/backup too).
             _gangGroup.SetRelationshipWith(player, rel);
             _gangGroup.SetRelationshipWith(cops, rel);
 
@@ -214,7 +248,6 @@ namespace DynamicHostileTerritories.Services
             return options[_rng.Next(options.Count)];
         }
 
-        // A random point within 'radius' meters of 'center' on the same Z plane.
         private Vector3 RandomPointAround(Vector3 center, float radius)
         {
             double angle = _rng.NextDouble() * Math.PI * 2.0;

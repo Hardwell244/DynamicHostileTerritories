@@ -1,5 +1,6 @@
 ﻿using System;
 using DynamicHostileTerritories.Configuration;
+using DynamicHostileTerritories.Core;
 using DynamicHostileTerritories.Data;
 using Rage;
 using Rage.Native;
@@ -44,10 +45,11 @@ namespace DynamicHostileTerritories.Services
 
             _spawnManager.Activate(territory, _tier);
 
-            // A high-tier area is already on edge the moment you arrive.
             _state = _tier >= HostilityLevel.Warzone ? EncounterState.Suspicious : EncounterState.Observing;
             _spawnManager.ApplyPosture(_state, _tier);
 
+            Logger.Info("Encounter begin at " + territory.Name + " — tier " + _tier
+                + ", strength " + (int)territory.Strength + "%, initial state " + _state + ".");
             NotifyEntering(territory);
         }
 
@@ -60,11 +62,11 @@ namespace DynamicHostileTerritories.Services
 
             EncounterState desired = EvaluateState(territory, player);
 
-            // Encounters only escalate; they reset when the player leaves the area.
             if ((int)desired > (int)_state)
             {
                 _state = desired;
                 _spawnManager.ApplyPosture(_state, _tier);
+                Logger.Info("Escalation at " + territory.Name + " -> " + _state + ".");
                 NotifyEscalation(territory, _state);
             }
         }
@@ -81,12 +83,9 @@ namespace DynamicHostileTerritories.Services
             _tier = HostilityLevel.Pacified;
             _state = EncounterState.Observing;
             _spawnManager.Deactivate();
+            Logger.Info("Encounter force-pacified.");
         }
 
-        /// <summary>
-        /// (Fix for issue 2) Re-evaluates the area tier on a timer while the player
-        /// stays inside, and respawns the gang if day/night or heat shifted the tier.
-        /// </summary>
         private void RecheckTierIfDue(Territory territory)
         {
             if ((DateTime.UtcNow - _lastTierCheckUtc).TotalSeconds < _settings.TierRecheckSeconds)
@@ -98,17 +97,17 @@ namespace DynamicHostileTerritories.Services
             if (newTier == _tier)
                 return;
 
+            Logger.Info("Tier change at " + territory.Name + ": " + _tier + " -> " + newTier + " (respawning).");
+
             _tier = newTier;
             territory.Hostility = newTier;
 
-            // Tier changes the size/weapons of the gang, so respawn, then keep the posture.
             _spawnManager.Activate(territory, newTier);
             _spawnManager.ApplyPosture(_state, _tier);
         }
 
         private EncounterState EvaluateState(Territory territory, Ped player)
         {
-            // A neutralised member spikes RecentHeat to 100 — treat that as blood drawn.
             bool bloodDrawn = territory.RecentHeat >= 60f;
             bool shooting = player.IsShooting;
             bool armed = NativeFunction.Natives.IS_PED_ARMED<bool>(player, 7);

@@ -2,17 +2,17 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using DynamicHostileTerritories.Core;
 using DynamicHostileTerritories.Data;
 using Newtonsoft.Json;
-using Rage;
 
 namespace DynamicHostileTerritories.Services
 {
     /// <summary>
     /// Persists the dynamic part of each territory (strength and last police action)
-    /// to a JSON file and restores it on load. We deliberately serialise a small DTO
-    /// instead of the live <see cref="Territory"/> object, so the save file stays clean
-    /// and is not coupled to game types like Vector3 or Gang.
+    /// to a JSON file and restores it on load. We serialise a small DTO instead of the
+    /// live Territory object, so the save file stays clean and is not coupled to game
+    /// types like Vector3 or Gang.
     /// </summary>
     public sealed class TerritoryStateStore
     {
@@ -29,17 +29,13 @@ namespace DynamicHostileTerritories.Services
                 SaveFileName);
         }
 
-        /// <summary>
-        /// Loads saved state and applies it onto the given live territories, matching
-        /// by name. Territories without a saved entry keep their seeded defaults.
-        /// </summary>
         public void Apply(IReadOnlyList<Territory> territories)
         {
             try
             {
                 if (!File.Exists(_fullPath))
                 {
-                    Game.LogTrivial("[DHT] No save file found; using seeded defaults.");
+                    Logger.Info("No save file found; using seeded defaults.");
                     return;
                 }
 
@@ -57,17 +53,14 @@ namespace DynamicHostileTerritories.Services
                     territory.LastPoliceActionUtc = data.LastPoliceActionUtc;
                 }
 
-                Game.LogTrivial("[DHT] Territory state restored from save.");
+                Logger.Info("Territory state restored from save (" + saved.Count + " entries).");
             }
             catch (Exception ex)
             {
-                Game.LogTrivial("[DHT] Failed to load save, keeping defaults: " + ex);
+                Logger.Error("Failed to load save, keeping defaults", ex);
             }
         }
 
-        /// <summary>
-        /// Writes the current persisted state of all territories to disk.
-        /// </summary>
         public void Save(IReadOnlyList<Territory> territories)
         {
             try
@@ -86,17 +79,14 @@ namespace DynamicHostileTerritories.Services
                 string json = JsonConvert.SerializeObject(data, Formatting.Indented);
                 File.WriteAllText(_fullPath, json);
 
-                Game.LogTrivial("[DHT] Territory state saved.");
+                Logger.Debug("Territory state saved (" + data.Count + " entries).");
             }
             catch (Exception ex)
             {
-                Game.LogTrivial("[DHT] Failed to save territory state: " + ex);
+                Logger.Error("Failed to save territory state", ex);
             }
         }
 
-        /// <summary>
-        /// Lightweight DTO. Only the fields worth persisting cross the wire.
-        /// </summary>
         private sealed class TerritorySaveData
         {
             public string Name { get; set; }

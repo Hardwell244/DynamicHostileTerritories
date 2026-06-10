@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using DynamicHostileTerritories.Configuration;
+using DynamicHostileTerritories.Core;
 using DynamicHostileTerritories.Data;
 using LSPD_First_Response.Mod.API;
 using Rage;
@@ -55,7 +56,7 @@ namespace DynamicHostileTerritories.Services
             _lastSaveUtc = DateTime.UtcNow;
             _loop = GameFiber.StartNew(Loop);
 
-            Game.LogTrivial("[DHT] Territory controller started.");
+            Logger.Info("Territory controller started. Watching " + _repository.Territories.Count + " territories.");
         }
 
         public void Stop()
@@ -74,7 +75,7 @@ namespace DynamicHostileTerritories.Services
                 _loop.Abort();
             _loop = null;
 
-            Game.LogTrivial("[DHT] Territory controller stopped.");
+            Logger.Info("Territory controller stopped.");
         }
 
         private void Loop()
@@ -87,7 +88,7 @@ namespace DynamicHostileTerritories.Services
                 }
                 catch (Exception ex)
                 {
-                    Game.LogTrivial("[DHT] Controller tick error: " + ex);
+                    Logger.Error("Controller tick error", ex);
                 }
 
                 GameFiber.Sleep(_settings.UpdateIntervalMs);
@@ -125,7 +126,7 @@ namespace DynamicHostileTerritories.Services
 
         private void AgeTerritories(float hoursElapsed, DateTime now)
         {
-            const float heatDecayPerHour = 200f; // recent heat fades within ~30 minutes
+            const float heatDecayPerHour = 200f;
 
             foreach (Territory t in _repository.Territories)
             {
@@ -158,16 +159,38 @@ namespace DynamicHostileTerritories.Services
             return best;
         }
 
+        /// <summary>
+        /// Switches the active territory. Hardened so a failure in Begin can never leave
+        /// us stranded on a half-initialised territory (the cause of "warned once, then
+        /// never again"): on failure we reset to null and retry on the next tick.
+        /// </summary>
         private void SwitchActiveTerritory(Territory nearest)
         {
             if (_activeTerritory != null)
+            {
+                Logger.Info("Leaving territory: " + _activeTerritory.Name + ".");
                 _director.End();
+            }
 
-            _activeTerritory = nearest;
             _countedNeutralised.Clear();
 
-            if (_activeTerritory != null)
-                _director.Begin(_activeTerritory);
+            if (nearest == null)
+            {
+                _activeTerritory = null;
+                return;
+            }
+
+            try
+            {
+                _director.Begin(nearest);
+                _activeTerritory = nearest;
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("Failed to begin encounter at " + nearest.Name + "; will retry", ex);
+                _director.End();
+                _activeTerritory = null;
+            }
         }
 
         private void DetectPoliceActions(Territory territory, DateTime now)
@@ -191,8 +214,7 @@ namespace DynamicHostileTerritories.Services
                     "~g~Police pressure~w~ in ~y~" + territory.Name
                     + "~w~. " + territory.ControllingGang.Name + " grip: " + (int)territory.Strength + "%.");
 
-                Game.LogTrivial("[DHT] Police action in " + territory.Name
-                    + " -> strength " + (int)territory.Strength + "%.");
+                Logger.Info("Police action in " + territory.Name + " -> strength " + (int)territory.Strength + "%.");
             }
         }
 
@@ -211,7 +233,7 @@ namespace DynamicHostileTerritories.Services
             _director.ForcePacify();
 
             Game.DisplayNotification("~g~" + _activeTerritory.Name + " pacified.~w~ The gang has scattered.");
-            Game.LogTrivial("[DHT] " + _activeTerritory.Name + " force-pacified via menu.");
+            Logger.Info(_activeTerritory.Name + " force-pacified via menu.");
         }
     }
 }

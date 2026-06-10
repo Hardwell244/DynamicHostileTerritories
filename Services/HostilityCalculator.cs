@@ -1,47 +1,45 @@
-﻿using DynamicHostileTerritories.Data;
+﻿using DynamicHostileTerritories.Configuration;
+using DynamicHostileTerritories.Data;
 using Rage;
 
 namespace DynamicHostileTerritories.Services
 {
     /// <summary>
     /// Turns a territory's continuous state (strength, recent heat) plus the time of
-    /// day into a discrete <see cref="HostilityLevel"/>. Pure decision logic: it reads
-    /// the territory and the world clock, and returns a level. It never spawns anything.
+    /// day into a discrete <see cref="HostilityLevel"/>. All thresholds, the night
+    /// bump and the maximum tier come from the .ini, so hostility is fully tunable.
+    /// Pure decision logic: it never spawns anything.
     /// </summary>
     public sealed class HostilityCalculator
     {
-        // Strength thresholds for the base tier.
-        private const float PacifiedBelow = 20f;
-        private const float WatchfulBelow = 50f;
-        private const float AggressiveBelow = 80f;
+        private readonly PluginSettings _settings;
 
-        // Recent heat above this counts as "something just happened here".
-        private const float HotHeatThreshold = 40f;
+        public HostilityCalculator(PluginSettings settings)
+        {
+            _settings = settings;
+        }
 
         public HostilityLevel Evaluate(Territory territory)
         {
+            if (territory.Strength < _settings.PacifiedBelow)
+                return HostilityLevel.Pacified;
+
             int level = (int)BaseLevelFromStrength(territory.Strength);
 
-            // Night emboldens the gang: bump one tier between 20:00 and 06:00.
-            if (IsNight())
+            if (_settings.NightEscalation && IsNight())
                 level++;
 
-            // A recent shootout/arrest spikes aggression for a while.
-            if (territory.RecentHeat >= HotHeatThreshold)
+            if (territory.RecentHeat >= _settings.HeatThreshold)
                 level++;
-
-            // A freshly pacified area never escalates, regardless of clock or heat.
-            if (territory.Strength < PacifiedBelow)
-                return HostilityLevel.Pacified;
 
             return Clamp(level);
         }
 
-        private static HostilityLevel BaseLevelFromStrength(float strength)
+        private HostilityLevel BaseLevelFromStrength(float strength)
         {
-            if (strength < PacifiedBelow) return HostilityLevel.Pacified;
-            if (strength < WatchfulBelow) return HostilityLevel.Watchful;
-            if (strength < AggressiveBelow) return HostilityLevel.Aggressive;
+            if (strength < _settings.PacifiedBelow) return HostilityLevel.Pacified;
+            if (strength < _settings.WatchfulBelow) return HostilityLevel.Watchful;
+            if (strength < _settings.AggressiveBelow) return HostilityLevel.Aggressive;
             return HostilityLevel.Warzone;
         }
 
@@ -51,10 +49,14 @@ namespace DynamicHostileTerritories.Services
             return hour >= 20 || hour < 6;
         }
 
-        private static HostilityLevel Clamp(int level)
+        private HostilityLevel Clamp(int level)
         {
-            if (level < (int)HostilityLevel.Pacified) return HostilityLevel.Pacified;
-            if (level > (int)HostilityLevel.Warzone) return HostilityLevel.Warzone;
+            int max = _settings.MaxHostility;
+            if (max > (int)HostilityLevel.Warzone) max = (int)HostilityLevel.Warzone;
+
+            if (level < (int)HostilityLevel.Pacified) level = (int)HostilityLevel.Pacified;
+            if (level > max) level = max;
+
             return (HostilityLevel)level;
         }
     }

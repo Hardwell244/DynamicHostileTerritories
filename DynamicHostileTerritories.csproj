@@ -79,6 +79,7 @@
   <ItemGroup>
     <Compile Include="Configuration\PluginSettings.cs" />
     <Compile Include="Core\EntryPoint.cs" />
+    <Compile Include="Core\Logger.cs" />
     <Compile Include="Data\EncounterState.cs" />
     <Compile Include="Data\Gang.cs" />
     <Compile Include="Data\HostilityLevel.cs" />
