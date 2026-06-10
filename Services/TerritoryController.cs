@@ -107,7 +107,7 @@ namespace DynamicHostileTerritories.Services
 
             AgeTerritories(hoursElapsed, now);
 
-            Territory nearest = FindActiveTerritory(player.Position);
+            Territory nearest = ResolveActiveTerritory(player.Position);
             if (nearest != _activeTerritory)
                 SwitchActiveTerritory(nearest);
 
@@ -126,7 +126,7 @@ namespace DynamicHostileTerritories.Services
 
         private void AgeTerritories(float hoursElapsed, DateTime now)
         {
-            const float heatDecayPerHour = 200f;
+            const float heatDecayPerHour = 200f; // recent heat fades within ~30 minutes
 
             foreach (Territory t in _repository.Territories)
             {
@@ -139,6 +139,23 @@ namespace DynamicHostileTerritories.Services
                 if (ignored && !suppressed && t.Strength < 100f)
                     t.Strength = Math.Min(100f, t.Strength + _settings.StrengthRegrowthPerHour * hoursElapsed);
             }
+        }
+
+        /// <summary>
+        /// Picks the active territory with hysteresis: once inside one, we keep it until
+        /// the player is clearly outside its leave radius. This stops the encounter from
+        /// flip-flopping (and constantly respawning) between two nearby turfs.
+        /// </summary>
+        private Territory ResolveActiveTerritory(Vector3 playerPos)
+        {
+            if (_activeTerritory != null)
+            {
+                float leaveDistance = _settings.ActivationDistance * 1.3f;
+                if (playerPos.DistanceTo(_activeTerritory.Center) <= leaveDistance)
+                    return _activeTerritory;
+            }
+
+            return FindActiveTerritory(playerPos);
         }
 
         private Territory FindActiveTerritory(Vector3 playerPos)
@@ -161,8 +178,8 @@ namespace DynamicHostileTerritories.Services
 
         /// <summary>
         /// Switches the active territory. Hardened so a failure in Begin can never leave
-        /// us stranded on a half-initialised territory (the cause of "warned once, then
-        /// never again"): on failure we reset to null and retry on the next tick.
+        /// us stranded on a half-initialised territory: on failure we reset to null and
+        /// retry on the next tick.
         /// </summary>
         private void SwitchActiveTerritory(Territory nearest)
         {

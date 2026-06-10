@@ -8,22 +8,64 @@ using Rage.Native;
 namespace DynamicHostileTerritories.Services
 {
     /// <summary>
-    /// Owns every entity spawned for the active territory and applies behaviour
-    /// "postures" to them. It does not decide WHEN to escalate (that is the
-    /// EncounterDirector); it only spawns/cleans up and re-tasks peds on command.
-    /// Nothing it spawns may outlive a call to Deactivate().
+    /// Owns every entity spawned for the active territory and keeps it feeling like a
+    /// LIVING, gang-controlled block: posted lookouts (armed at higher tiers), members
+    /// patrolling/circulating the turf, others loitering, plus a manned roadblock. The
+    /// ambient presence runs continuously; the EncounterDirector layers alert/combat on
+    /// top by re-tasking on command. Nothing it spawns outlives Deactivate().
     /// </summary>
     public sealed class GangSpawnManager
     {
+        private enum Role { Sentry, Loiter, Patrol, Guard }
+
+        private sealed class Member
+        {
+            public Ped Ped;
+            public Vector3 Home;
+            public Role Role;
+            public string Weapon;
+        }
+
+        private static readonly string[] LoiterScenarios =
+        {
+            "WORLD_HUMAN_SMOKING",
+            "WORLD_HUMAN_STAND_MOBILE",
+            "WORLD_HUMAN_HANG_OUT_STREET",
+            "WORLD_HUMAN_DRINKING",
+            "WORLD_HUMAN_LEANING",
+            "WORLD_HUMAN_AA_SMOKE"
+        };
+
+        private static readonly string[] WatchfulWeapons =
+        {
+            "weapon_pistol", "weapon_pistol", "weapon_combatpistol", "weapon_microsmg"
+        };
+
+        private static readonly string[] AggressiveWeapons =
+        {
+            "weapon_microsmg", "weapon_smg", "weapon_assaultrifle", "weapon_pumpshotgun"
+        };
+
+        private static readonly string[] WarzoneWeapons =
+        {
+            "weapon_carbinerifle", "weapon_assaultrifle", "weapon_specialcarbine", "weapon_smg", "weapon_pumpshotgun"
+        };
+
         private readonly int _maxPeds;
         private readonly Random _rng = new Random();
 
-        private readonly List<Ped> _peds = new List<Ped>();
+        private readonly List<Member> _members = new List<Member>();
+        private readonly List<Ped> _peds = new List<Ped>(); // mirror, kept in sync for cleanup + police detection
         private readonly List<Vehicle> _vehicles = new List<Vehicle>();
 
         private RelationshipGroup _gangGroup;
-        private bool _hasGangGroup; // RelationshipGroup is a struct (can't be null), so track this explicitly
+        private bool _hasGangGroup;
         private bool _isActive;
+
+        private Territory _territory;
+        private HostilityLevel _tier;
+        private Vector3 _roadblockPos;
+        private bool _hasRoadblock;
 
         public IReadOnlyList<Ped> SpawnedPeds => _peds;
         public bool IsActive => _isActive;
@@ -34,13 +76,17 @@ namespace DynamicHostileTerritories.Services
         }
 
         /// <summary>
-        /// Spawns the gang for the given tier. Spawns are staggered across frames so
-        /// we never mass-spawn. Behaviour is NOT set here — call ApplyPosture next.
+        /// Spawns and stages the gang for the given tier. Spawns are staggered across
+        /// frames. Behaviour is NOT set here — call ApplyPosture next.
         /// </summary>
         public void Activate(Territory territory, HostilityLevel tier)
         {
             if (_isActive)
                 Deactivate();
+
+            _territory = territory;
+            _tier = tier;
+            _hasRoadblock = false;
 
             if (tier == HostilityLevel.Pacified || _maxPeds <= 0)
             {
@@ -54,47 +100,92 @@ namespace DynamicHostileTerritories.Services
             _hasGangGroup = true;
 
             int desired = Math.Min(PedCountFor(tier), _maxPeds);
-            string weapon = WeaponFor(tier);
+            int guards = tier >= HostilityLevel.Warzone ? 3 : (tier >= HostilityLevel.Aggressive ? 2 : 0);
+            guards = Math.Min(guards, desired);
+
+            if (guards > 0 && !SpawnRoadblockVehicle(territory))
+                guards = 0;
+            else if (guards > 0)
+                _hasRoadblock = true;
+
+            int remaining = desired - guards;
+            int patrols = Math.Max(1, remaining / 3);
+            int sentries = remaining / 3;
+            // whatever is left becomes loiterers
 
             int spawned = 0;
             for (int i = 0; i < desired; i++)
             {
-                if (SpawnGangMember(territory, weapon))
-                    spawned++;
-                GameFiber.Sleep(150); // stagger to spread the load
-            }
+                Role role;
+                if (i < guards) role = Role.Guard;
+                else if (i < guards + patrols) role = Role.Patrol;
+                else if (i < guards + patrols + sentries) role = Role.Sentry;
+                else role = Role.Loiter;
 
-            if (tier >= HostilityLevel.Aggressive)
-                SpawnGangVehicle(territory);
+                Vector3 pos = (role == Role.Guard && _hasRoadblock)
+                    ? RandomPointAround(_roadblockPos, 4f)
+                    : RingPoint(territory.Center, territory.Radius, i, desired);
+
+                if (SpawnMember(pos, role, tier))
+                    spawned++;
+
+                GameFiber.Sleep(100);
+            }
 
             _isActive = true;
             Logger.Info("Activated " + territory.Name + " (" + territory.ControllingGang.Name
-                + ", tier " + tier + "): " + spawned + "/" + desired + " peds, weapon " + weapon + ".");
+                + ", tier " + tier + "): " + spawned + "/" + desired + " peds (" + patrols + " patrol, "
+                + sentries + " sentry, " + guards + " roadblock), roadblock " + _hasRoadblock + ".");
+        }
+
+        /// <summary>
+        /// One extra wave of fighters from the edges of the turf when war erupts.
+        /// Tasked by the next ApplyPosture(War) call.
+        /// </summary>
+        public void Reinforce(Territory territory, HostilityLevel tier)
+        {
+            if (!_hasGangGroup)
+                return;
+
+            int wave = tier >= HostilityLevel.Warzone ? 6 : 4;
+            int spawned = 0;
+
+            for (int i = 0; i < wave; i++)
+            {
+                Vector3 pos = RingPoint(territory.Center, territory.Radius, i, wave, 0.9f);
+                if (SpawnMember(pos, Role.Guard, tier))
+                    spawned++;
+                GameFiber.Sleep(80);
+            }
+
+            Logger.Info("Reinforcements arrived at " + territory.Name + ": " + spawned + " extra fighters.");
         }
 
         public void Deactivate()
         {
             int peds = _peds.Count;
-            int vehicles = _vehicles.Count;
 
-            foreach (Ped ped in _peds)
-                if (ped.Exists()) ped.Delete();
+            foreach (Member m in _members)
+                if (m.Ped.Exists()) m.Ped.Delete();
+            _members.Clear();
             _peds.Clear();
 
-            foreach (Vehicle vehicle in _vehicles)
-                if (vehicle.Exists()) vehicle.Delete();
+            foreach (Vehicle v in _vehicles)
+                if (v.Exists()) v.Delete();
             _vehicles.Clear();
 
             _hasGangGroup = false;
+            _hasRoadblock = false;
             _isActive = false;
 
-            if (peds > 0 || vehicles > 0)
-                Logger.Debug("Deactivated and cleaned up " + peds + " peds, " + vehicles + " vehicles.");
+            if (peds > 0)
+                Logger.Debug("Deactivated and cleaned up " + peds + " peds.");
         }
 
         /// <summary>
-        /// Re-tasks every living gang member to match the current encounter posture,
-        /// and sets how the gang feels about the player AND the cops.
+        /// Re-tasks every living member for the current posture, and sets how the gang
+        /// feels about the player and the cops. Observing = the living ambient presence;
+        /// Suspicious/Provoked = noticed you, posting up armed; War = open combat.
         /// </summary>
         public void ApplyPosture(EncounterState state, HostilityLevel tier)
         {
@@ -105,43 +196,87 @@ namespace DynamicHostileTerritories.Services
 
             Ped player = Game.LocalPlayer.Character;
 
-            foreach (Ped ped in _peds)
+            foreach (Member m in _members)
             {
-                if (!ped.Exists())
+                if (!m.Ped.Exists())
                     continue;
 
                 switch (state)
                 {
                     case EncounterState.Observing:
-                        ped.BlockPermanentEvents = true;
-                        NativeFunction.Natives.TASK_TURN_PED_TO_FACE_ENTITY(ped, player, 3000);
+                        StagePresence(m);
                         break;
 
                     case EncounterState.Suspicious:
-                        ped.BlockPermanentEvents = true;
-                        NativeFunction.Natives.TASK_FOLLOW_TO_OFFSET_OF_ENTITY(
-                            ped, player, 0f, 0f, 0f, 1.5f, -1, 8f, true);
+                        // Noticed you: stop, draw, face you and hold the spot. No chasing.
+                        m.Ped.Tasks.Clear();
+                        m.Ped.BlockPermanentEvents = false;
+                        EquipWeapon(m);
+                        NativeFunction.Natives.TASK_TURN_PED_TO_FACE_ENTITY(m.Ped, player, 4000);
+                        NativeFunction.Natives.TASK_GUARD_CURRENT_POSITION(m.Ped, 8f, 8f, true);
                         break;
 
                     case EncounterState.Provoked:
-                        ped.BlockPermanentEvents = false;
-                        NativeFunction.Natives.TASK_GUARD_CURRENT_POSITION(ped, 15f, 15f, true);
+                        // Weapons up, defending their ground; will fire if you push it.
+                        m.Ped.Tasks.Clear();
+                        m.Ped.BlockPermanentEvents = false;
+                        EquipWeapon(m);
+                        NativeFunction.Natives.TASK_GUARD_CURRENT_POSITION(m.Ped, 20f, 20f, true);
                         break;
 
                     case EncounterState.War:
-                        ped.BlockPermanentEvents = false;
-                        ped.Tasks.TakeCoverAt(ped.Position, player.Position, -1, true);
+                        // Open combat: the AI advances, flanks and uses cover on its own.
+                        m.Ped.Tasks.Clear();
+                        m.Ped.BlockPermanentEvents = false;
+                        NativeFunction.Natives.TASK_COMBAT_PED(m.Ped, player, 0, 16);
                         break;
                 }
             }
 
-            Logger.Debug("Applied posture " + state + " to " + _peds.Count + " peds.");
+            Logger.Debug("Applied posture " + state + " to " + _members.Count + " members.");
         }
 
-        private bool SpawnGangMember(Territory territory, string weapon)
+        // --- Living ambient presence (Observing) ------------------------------------------
+
+        private void StagePresence(Member m)
         {
-            string model = Pick(territory.ControllingGang.PedModels);
-            Vector3 around = RandomPointAround(territory.Center, territory.Radius * 0.6f);
+            m.Ped.BlockPermanentEvents = true;
+            bool armedPresence = _tier >= HostilityLevel.Aggressive;
+
+            switch (m.Role)
+            {
+                case Role.Sentry:
+                case Role.Guard:
+                    if (armedPresence)
+                    {
+                        // Armed lookout: stands holding the weapon, watching the block.
+                        EquipWeapon(m);
+                        NativeFunction.Natives.TASK_GUARD_CURRENT_POSITION(m.Ped, 5f, 5f, true);
+                    }
+                    else
+                    {
+                        NativeFunction.Natives.TASK_START_SCENARIO_IN_PLACE(m.Ped, "WORLD_HUMAN_GUARD_STAND", 0, true);
+                    }
+                    break;
+
+                case Role.Loiter:
+                    string scenario = LoiterScenarios[_rng.Next(LoiterScenarios.Length)];
+                    NativeFunction.Natives.TASK_START_SCENARIO_IN_PLACE(m.Ped, scenario, 0, true);
+                    break;
+
+                case Role.Patrol:
+                    // Walks the block. Weapon holstered while patrolling; drawn when alerted.
+                    Vector3 c = _territory.Center;
+                    NativeFunction.Natives.TASK_WANDER_IN_AREA(m.Ped, c.X, c.Y, c.Z, _territory.Radius * 0.7f, 4f, 7f);
+                    break;
+            }
+        }
+
+        // --- Spawning ---------------------------------------------------------------------
+
+        private bool SpawnMember(Vector3 around, Role role, HostilityLevel tier)
+        {
+            string model = Pick(_territory.ControllingGang.PedModels);
 
             Vector3 spawnPos = around;
             if (NativeFunction.Natives.GET_SAFE_COORD_FOR_PED<bool>(around.X, around.Y, around.Z, true, out Vector3 safe, 0))
@@ -166,34 +301,70 @@ namespace DynamicHostileTerritories.Services
                 return false;
             }
 
+            string weapon = PickWeapon(tier);
+
             ped.IsPersistent = true;
+            ped.BlockPermanentEvents = true;
             ped.RelationshipGroup = _gangGroup;
-            ped.Inventory.GiveNewWeapon(weapon, -1, false); // holstered until a hostile posture
+            ApplyStats(ped, tier);
+            ped.Inventory.GiveNewWeapon(weapon, -1, false); // holstered until staged/alerted
+
+            _members.Add(new Member { Ped = ped, Home = spawnPos, Role = role, Weapon = weapon });
             _peds.Add(ped);
             return true;
         }
 
-        private void SpawnGangVehicle(Territory territory)
+        private bool SpawnRoadblockVehicle(Territory territory)
         {
             string model = Pick(territory.ControllingGang.VehicleModels);
-            Vector3 pos = World.GetNextPositionOnStreet(RandomPointAround(territory.Center, territory.Radius * 0.5f));
+            Vector3 pos = World.GetNextPositionOnStreet(RandomPointAround(territory.Center, territory.Radius * 0.4f));
 
             try
             {
                 Vehicle vehicle = new Vehicle(model, pos);
                 if (!vehicle.Exists())
                 {
-                    Logger.Warn("Vehicle model '" + model + "' did not materialise.");
-                    return;
+                    Logger.Warn("Roadblock vehicle model '" + model + "' did not materialise.");
+                    return false;
                 }
 
                 vehicle.IsPersistent = true;
                 _vehicles.Add(vehicle);
+                _roadblockPos = vehicle.Position;
+                return true;
             }
             catch (Exception ex)
             {
-                Logger.Warn("Failed to spawn vehicle model '" + model + "': " + ex.Message);
+                Logger.Warn("Failed to spawn roadblock vehicle '" + model + "': " + ex.Message);
+                return false;
             }
+        }
+
+        private void ApplyStats(Ped ped, HostilityLevel tier)
+        {
+            switch (tier)
+            {
+                case HostilityLevel.Watchful:
+                    ped.Accuracy = 20;
+                    ped.Armor = 0;
+                    break;
+                case HostilityLevel.Aggressive:
+                    ped.Accuracy = 40;
+                    ped.Armor = 25;
+                    break;
+                case HostilityLevel.Warzone:
+                    ped.Accuracy = 60;
+                    ped.Armor = 75;
+                    break;
+            }
+        }
+
+        private void EquipWeapon(Member m)
+        {
+            if (string.IsNullOrEmpty(m.Weapon) || m.Weapon == "weapon_unarmed")
+                return;
+
+            NativeFunction.Natives.SET_CURRENT_PED_WEAPON(m.Ped, Game.GetHashKey(m.Weapon), true);
         }
 
         private void ApplyRelationship(EncounterState state)
@@ -209,11 +380,9 @@ namespace DynamicHostileTerritories.Services
                 default: rel = Relationship.Neutral; break;
             }
 
-            // Gang's stance toward player AND police (so they engage your partner/backup too).
             _gangGroup.SetRelationshipWith(player, rel);
             _gangGroup.SetRelationshipWith(cops, rel);
 
-            // At war, make it mutual so officers fight back.
             if (state == EncounterState.War)
             {
                 player.SetRelationshipWith(_gangGroup, Relationship.Hate);
@@ -221,24 +390,26 @@ namespace DynamicHostileTerritories.Services
             }
         }
 
+        // --- Helpers ----------------------------------------------------------------------
+
         private static int PedCountFor(HostilityLevel tier)
         {
             switch (tier)
             {
-                case HostilityLevel.Watchful: return 2;
-                case HostilityLevel.Aggressive: return 3;
-                case HostilityLevel.Warzone: return 4;
+                case HostilityLevel.Watchful: return 5;
+                case HostilityLevel.Aggressive: return 9;
+                case HostilityLevel.Warzone: return 14;
                 default: return 0;
             }
         }
 
-        private static string WeaponFor(HostilityLevel tier)
+        private string PickWeapon(HostilityLevel tier)
         {
             switch (tier)
             {
-                case HostilityLevel.Watchful: return "weapon_pistol";
-                case HostilityLevel.Aggressive: return "weapon_microsmg";
-                case HostilityLevel.Warzone: return "weapon_carbinerifle";
+                case HostilityLevel.Watchful: return WatchfulWeapons[_rng.Next(WatchfulWeapons.Length)];
+                case HostilityLevel.Aggressive: return AggressiveWeapons[_rng.Next(AggressiveWeapons.Length)];
+                case HostilityLevel.Warzone: return WarzoneWeapons[_rng.Next(WarzoneWeapons.Length)];
                 default: return "weapon_unarmed";
             }
         }
@@ -246,6 +417,19 @@ namespace DynamicHostileTerritories.Services
         private string Pick(IReadOnlyList<string> options)
         {
             return options[_rng.Next(options.Count)];
+        }
+
+        private Vector3 RingPoint(Vector3 center, float radius, int index, int count, float spreadFactor = 0.6f)
+        {
+            // Spread members around the core so the turf feels occupied as you push in.
+            double baseAngle = (index / (double)Math.Max(1, count)) * Math.PI * 2.0;
+            double jitter = (_rng.NextDouble() - 0.5) * 0.7;
+            double angle = baseAngle + jitter;
+            float distance = radius * spreadFactor * (0.5f + (float)_rng.NextDouble() * 0.8f);
+
+            float x = center.X + (float)Math.Cos(angle) * distance;
+            float y = center.Y + (float)Math.Sin(angle) * distance;
+            return new Vector3(x, y, center.Z);
         }
 
         private Vector3 RandomPointAround(Vector3 center, float radius)

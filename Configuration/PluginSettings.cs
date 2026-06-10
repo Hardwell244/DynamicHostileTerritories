@@ -65,14 +65,14 @@ namespace DynamicHostileTerritories.Configuration
                 s.DebugLogging = ini.ReadBoolean("General", "DebugLogging", false);
 
                 s.ActivationDistance = ini.ReadSingle("Performance", "ActivationDistance", 150f);
-                s.MaxSpawnedPeds = ini.ReadInt32("Performance", "MaxSpawnedPeds", 6);
+                s.MaxSpawnedPeds = ini.ReadInt32("Performance", "MaxSpawnedPeds", 10);
                 s.UpdateIntervalMs = ini.ReadInt32("Performance", "UpdateIntervalMs", 1500);
 
                 s.PoliceActionStrengthDrop = ini.ReadSingle("Territory", "PoliceActionStrengthDrop", 15f);
                 s.StrengthRegrowthPerHour = ini.ReadSingle("Territory", "StrengthRegrowthPerHour", 4f);
                 s.SuppressionHours = ini.ReadSingle("Territory", "SuppressionHours", 6f);
 
-                s.SuspicionDelaySeconds = ini.ReadSingle("Encounter", "SuspicionDelaySeconds", 25f);
+                s.SuspicionDelaySeconds = ini.ReadSingle("Encounter", "SuspicionDelaySeconds", 12f);
                 s.TierRecheckSeconds = ini.ReadSingle("Encounter", "TierRecheckSeconds", 30f);
 
                 s.PacifiedBelow = ini.ReadSingle("Hostility", "PacifiedBelow", 20f);
@@ -93,12 +93,12 @@ namespace DynamicHostileTerritories.Configuration
                 s.Enabled = true;
                 s.DebugLogging = false;
                 s.ActivationDistance = 150f;
-                s.MaxSpawnedPeds = 6;
+                s.MaxSpawnedPeds = 10;
                 s.UpdateIntervalMs = 1500;
                 s.PoliceActionStrengthDrop = 15f;
                 s.StrengthRegrowthPerHour = 4f;
                 s.SuppressionHours = 6f;
-                s.SuspicionDelaySeconds = 25f;
+                s.SuspicionDelaySeconds = 12f;
                 s.TierRecheckSeconds = 30f;
                 s.PacifiedBelow = 20f;
                 s.WatchfulBelow = 50f;
