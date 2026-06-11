@@ -10,9 +10,10 @@ namespace DynamicHostileTerritories.Services
     /// <summary>
     /// Owns every entity spawned for the active territory and keeps it feeling like a
     /// LIVING, gang-controlled block: posted lookouts (armed at higher tiers), members
-    /// patrolling/circulating the turf, others loitering, plus a manned roadblock. The
-    /// ambient presence runs continuously; the EncounterDirector layers alert/combat on
-    /// top by re-tasking on command. Nothing it spawns outlives Deactivate().
+    /// patrolling/circulating the turf, others loitering, plus a manned roadblock. When
+    /// provoked, mobile members peel off to ambush/encircle the player. The ambient
+    /// presence runs continuously; the EncounterDirector layers alert/combat on top by
+    /// re-tasking on command. Nothing it spawns outlives Deactivate().
     /// </summary>
     public sealed class GangSpawnManager
     {
@@ -97,6 +98,7 @@ namespace DynamicHostileTerritories.Services
             }
 
             _gangGroup = new RelationshipGroup("DHT_" + territory.ControllingGang.Name);
+            _gangGroup.SetRelationshipWith(_gangGroup, Relationship.Companion); // same crew — never shoot each other
             _hasGangGroup = true;
 
             int desired = Math.Min(PedCountFor(tier), _maxPeds);
@@ -185,7 +187,8 @@ namespace DynamicHostileTerritories.Services
         /// <summary>
         /// Re-tasks every living member for the current posture, and sets how the gang
         /// feels about the player and the cops. Observing = the living ambient presence;
-        /// Suspicious/Provoked = noticed you, posting up armed; War = open combat.
+        /// Suspicious = noticed you, posting up armed; Provoked = ambush/encircle; War =
+        /// open combat.
         /// </summary>
         public void ApplyPosture(EncounterState state, HostilityLevel tier)
         {
@@ -195,6 +198,14 @@ namespace DynamicHostileTerritories.Services
             ApplyRelationship(state);
 
             Ped player = Game.LocalPlayer.Character;
+
+            // For the Provoked ambush: mobile members (patrol/loiter) peel off to encircle
+            // the player from different bearings while the posted ones hold the core.
+            int flankTotal = 0;
+            if (state == EncounterState.Provoked)
+                foreach (Member fm in _members)
+                    if (fm.Role == Role.Patrol || fm.Role == Role.Loiter) flankTotal++;
+            int flankIndex = 0;
 
             foreach (Member m in _members)
             {
@@ -217,11 +228,22 @@ namespace DynamicHostileTerritories.Services
                         break;
 
                     case EncounterState.Provoked:
-                        // Weapons up, defending their ground; will fire if you push it.
+                        // AMBUSH: mobile members move to surround the player from several
+                        // bearings; posted members (sentry/roadblock) hold the core. When
+                        // war breaks out everyone is already closing the pincer.
                         m.Ped.Tasks.Clear();
                         m.Ped.BlockPermanentEvents = false;
                         EquipWeapon(m);
-                        NativeFunction.Natives.TASK_GUARD_CURRENT_POSITION(m.Ped, 20f, 20f, true);
+                        if (m.Role == Role.Patrol || m.Role == Role.Loiter)
+                        {
+                            Vector3 flank = EncirclePoint(player.Position, 18f, flankIndex, flankTotal);
+                            flankIndex++;
+                            m.Ped.Tasks.FollowNavigationMeshToPosition(flank, 0f, 2.5f);
+                        }
+                        else
+                        {
+                            NativeFunction.Natives.TASK_GUARD_CURRENT_POSITION(m.Ped, 20f, 20f, true);
+                        }
                         break;
 
                     case EncounterState.War:
@@ -396,9 +418,9 @@ namespace DynamicHostileTerritories.Services
         {
             switch (tier)
             {
-                case HostilityLevel.Watchful: return 5;
-                case HostilityLevel.Aggressive: return 9;
-                case HostilityLevel.Warzone: return 14;
+                case HostilityLevel.Watchful: return 6;
+                case HostilityLevel.Aggressive: return 12;
+                case HostilityLevel.Warzone: return 18;
                 default: return 0;
             }
         }
@@ -417,6 +439,22 @@ namespace DynamicHostileTerritories.Services
         private string Pick(IReadOnlyList<string> options)
         {
             return options[_rng.Next(options.Count)];
+        }
+
+        /// <summary>
+        /// A snapped point on a ring around the player, used to surround them during an
+        /// ambush. Bearings are spread so closers come in from different sides.
+        /// </summary>
+        private Vector3 EncirclePoint(Vector3 playerPos, float radius, int index, int count)
+        {
+            double angle = (index / (double)Math.Max(1, count)) * Math.PI * 2.0;
+            float x = playerPos.X + (float)Math.Cos(angle) * radius;
+            float y = playerPos.Y + (float)Math.Sin(angle) * radius;
+
+            Vector3 point = new Vector3(x, y, playerPos.Z);
+            if (NativeFunction.Natives.GET_SAFE_COORD_FOR_PED<bool>(point.X, point.Y, point.Z, true, out Vector3 safe, 0))
+                point = safe;
+            return point;
         }
 
         private Vector3 RingPoint(Vector3 center, float radius, int index, int count, float spreadFactor = 0.6f)
