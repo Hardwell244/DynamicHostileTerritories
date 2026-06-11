@@ -227,6 +227,16 @@ namespace DynamicHostileTerritories.Services
                 territory.LastPoliceActionUtc = now;
                 territory.RecentHeat = 100f;
 
+                // Grudge: hit one of a gang's turfs and the whole gang gets angrier —
+                // their other territories heat up and tier up the next time you roll in.
+                foreach (Territory other in _repository.Territories)
+                {
+                    if (other == territory)
+                        continue;
+                    if (other.ControllingGang == territory.ControllingGang)
+                        other.RecentHeat = Math.Min(100f, other.RecentHeat + 25f);
+                }
+
                 Game.DisplayNotification(
                     "~g~Police pressure~w~ in ~y~" + territory.Name
                     + "~w~. " + territory.ControllingGang.Name + " grip: " + (int)territory.Strength + "%.");

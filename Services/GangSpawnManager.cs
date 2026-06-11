@@ -11,9 +11,10 @@ namespace DynamicHostileTerritories.Services
     /// Owns every entity spawned for the active territory and keeps it feeling like a
     /// LIVING, gang-controlled block: posted lookouts (armed at higher tiers), members
     /// patrolling/circulating the turf, others loitering, plus a manned roadblock. When
-    /// provoked, mobile members peel off to ambush/encircle the player. The ambient
-    /// presence runs continuously; the EncounterDirector layers alert/combat on top by
-    /// re-tasking on command. Nothing it spawns outlives Deactivate().
+    /// provoked, mobile members peel off to ambush/encircle the player; when a war is
+    /// nearly lost the survivors can surrender. The ambient presence runs continuously;
+    /// the EncounterDirector layers alert/combat on top. Nothing it spawns outlives
+    /// Deactivate().
     /// </summary>
     public sealed class GangSpawnManager
     {
@@ -52,6 +53,20 @@ namespace DynamicHostileTerritories.Services
             "weapon_carbinerifle", "weapon_assaultrifle", "weapon_specialcarbine", "weapon_smg", "weapon_pumpshotgun"
         };
 
+        // Generic rival crew that invades a turf during a gang-vs-gang skirmish.
+        private static readonly string[] RivalModels =
+        {
+            "g_m_y_strpunk_01", "g_m_y_strpunk_02", "g_m_y_armgoon_02", "g_m_y_mexgoon_02"
+        };
+
+        // Self-contained gang-vs-gang skirmish (separate peds/groups; ignores the player
+        // encounter state machine entirely).
+        private RelationshipGroup _skDefGroup;
+        private RelationshipGroup _skAtkGroup;
+        private readonly List<Ped> _skirmishPeds = new List<Ped>();
+        private bool _skirmishActive;
+        private DateTime _skirmishEndsUtc;
+
         private readonly int _maxPeds;
         private readonly Random _rng = new Random();
 
@@ -67,6 +82,7 @@ namespace DynamicHostileTerritories.Services
         private HostilityLevel _tier;
         private Vector3 _roadblockPos;
         private bool _hasRoadblock;
+        private bool _surrendered;
 
         public IReadOnlyList<Ped> SpawnedPeds => _peds;
         public bool IsActive => _isActive;
@@ -88,6 +104,7 @@ namespace DynamicHostileTerritories.Services
             _territory = territory;
             _tier = tier;
             _hasRoadblock = false;
+            _surrendered = false;
 
             if (tier == HostilityLevel.Pacified || _maxPeds <= 0)
             {
@@ -163,9 +180,171 @@ namespace DynamicHostileTerritories.Services
             Logger.Info("Reinforcements arrived at " + territory.Name + ": " + spawned + " extra fighters.");
         }
 
+        /// <summary>Number of members still alive and able to fight.</summary>
+        public int LivingFighters
+        {
+            get
+            {
+                int n = 0;
+                foreach (Member m in _members)
+                    if (m.Ped.Exists() && !m.Ped.IsDead) n++;
+                return n;
+            }
+        }
+
+        /// <summary>
+        /// The crew throws in the towel: stands down, hands up, no longer hostile to the
+        /// player or cops, so the survivors can be cuffed (arrests still drop the grip).
+        /// Idempotent — returns true only on the transition into surrender.
+        /// </summary>
+        public bool Surrender()
+        {
+            if (!_hasGangGroup || _surrendered)
+                return false;
+
+            _surrendered = true;
+
+            RelationshipGroup player = Game.LocalPlayer.Character.RelationshipGroup;
+            RelationshipGroup cops = RelationshipGroup.Cop;
+            _gangGroup.SetRelationshipWith(player, Relationship.Neutral);
+            _gangGroup.SetRelationshipWith(cops, Relationship.Neutral);
+            player.SetRelationshipWith(_gangGroup, Relationship.Neutral);
+            cops.SetRelationshipWith(_gangGroup, Relationship.Neutral);
+
+            int count = 0;
+            foreach (Member m in _members)
+            {
+                if (!m.Ped.Exists() || m.Ped.IsDead)
+                    continue;
+
+                m.Ped.Tasks.Clear();
+                m.Ped.BlockPermanentEvents = true;
+                NativeFunction.Natives.TASK_HANDS_UP(m.Ped, -1, 0, -1, 0);
+                count++;
+            }
+
+            Logger.Info("Gang surrendered (" + count + " hands up).");
+            return true;
+        }
+
+        // --- Gang-vs-gang skirmish (self-contained ambient event) -------------------------
+
+        /// <summary>
+        /// A rival crew rolls into the turf and fights the controlling gang. These are
+        /// their own peds in their own groups (neutral to the player and cops) and are
+        /// NOT part of the encounter — killing them does not move the grip. The player can
+        /// just watch the two sides go at it, or wade in. Returns true if it started.
+        /// </summary>
+        public bool TriggerSkirmish(Territory territory)
+        {
+            if (!_isActive || _skirmishActive || _surrendered)
+                return false;
+
+            _skDefGroup = new RelationshipGroup("DHT_SkDef_" + territory.Name);
+            _skAtkGroup = new RelationshipGroup("DHT_SkAtk_" + territory.Name);
+            _skDefGroup.SetRelationshipWith(_skDefGroup, Relationship.Companion);
+            _skAtkGroup.SetRelationshipWith(_skAtkGroup, Relationship.Companion);
+            _skDefGroup.SetRelationshipWith(_skAtkGroup, Relationship.Hate);
+            _skAtkGroup.SetRelationshipWith(_skDefGroup, Relationship.Hate);
+
+            Vector3 defPos = RingPoint(territory.Center, territory.Radius, 0, 1, 0.55f);
+            Vector3 atkPos = RingPoint(territory.Center, territory.Radius, 0, 1, 0.85f);
+
+            List<Ped> defenders = SpawnSkirmishSide(territory.ControllingGang.PedModels, _skDefGroup, defPos, 3);
+            List<Ped> attackers = SpawnSkirmishSide(RivalModels, _skAtkGroup, atkPos, 3);
+
+            if (defenders.Count == 0 || attackers.Count == 0)
+            {
+                EndSkirmish();
+                return false;
+            }
+
+            foreach (Ped d in defenders)
+            {
+                Ped t = attackers[_rng.Next(attackers.Count)];
+                if (d.Exists() && t.Exists())
+                    NativeFunction.Natives.TASK_COMBAT_PED(d, t, 0, 16);
+            }
+            foreach (Ped a in attackers)
+            {
+                Ped t = defenders[_rng.Next(defenders.Count)];
+                if (a.Exists() && t.Exists())
+                    NativeFunction.Natives.TASK_COMBAT_PED(a, t, 0, 16);
+            }
+
+            _skirmishActive = true;
+            _skirmishEndsUtc = DateTime.UtcNow.AddSeconds(90);
+            Logger.Info("Turf skirmish at " + territory.Name + " (" + defenders.Count + " vs " + attackers.Count + ").");
+            Game.DisplayNotification("~r~Gang clash~w~ in ~o~" + territory.Name + "~w~ — a rival crew is moving in.");
+            return true;
+        }
+
+        /// <summary>Cleans the skirmish up once it times out or one side is wiped.</summary>
+        public void UpdateSkirmish()
+        {
+            if (!_skirmishActive)
+                return;
+
+            int alive = 0;
+            foreach (Ped p in _skirmishPeds)
+                if (p.Exists() && !p.IsDead) alive++;
+
+            if (DateTime.UtcNow >= _skirmishEndsUtc || alive <= 1)
+                EndSkirmish();
+        }
+
+        private List<Ped> SpawnSkirmishSide(IReadOnlyList<string> models, RelationshipGroup group, Vector3 around, int count)
+        {
+            List<Ped> list = new List<Ped>();
+
+            for (int i = 0; i < count; i++)
+            {
+                Vector3 p = RandomPointAround(around, 5f);
+                if (NativeFunction.Natives.GET_SAFE_COORD_FOR_PED<bool>(p.X, p.Y, p.Z, true, out Vector3 safe, 0))
+                    p = safe;
+
+                string model = models[_rng.Next(models.Count)];
+
+                Ped ped;
+                try
+                {
+                    ped = new Ped(model, p, _rng.Next(0, 360));
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warn("Skirmish ped '" + model + "' failed: " + ex.Message);
+                    continue;
+                }
+
+                if (!ped.Exists())
+                    continue;
+
+                ped.IsPersistent = true;
+                ped.BlockPermanentEvents = false;
+                ped.RelationshipGroup = group;
+                ped.Accuracy = 25;
+                ped.Inventory.GiveNewWeapon("weapon_microsmg", -1, true);
+
+                _skirmishPeds.Add(ped);
+                list.Add(ped);
+                GameFiber.Sleep(60);
+            }
+
+            return list;
+        }
+
+        private void EndSkirmish()
+        {
+            foreach (Ped p in _skirmishPeds)
+                if (p.Exists()) p.Delete();
+            _skirmishPeds.Clear();
+            _skirmishActive = false;
+        }
+
         public void Deactivate()
         {
             int peds = _peds.Count;
+            EndSkirmish();
 
             foreach (Member m in _members)
                 if (m.Ped.Exists()) m.Ped.Delete();
@@ -178,6 +357,7 @@ namespace DynamicHostileTerritories.Services
 
             _hasGangGroup = false;
             _hasRoadblock = false;
+            _surrendered = false;
             _isActive = false;
 
             if (peds > 0)
@@ -194,6 +374,9 @@ namespace DynamicHostileTerritories.Services
         {
             if (!_hasGangGroup)
                 return;
+
+            if (_surrendered)
+                return; // hands up — never re-task them back into the fight
 
             ApplyRelationship(state);
 

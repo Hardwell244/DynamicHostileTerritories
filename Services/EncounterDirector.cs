@@ -28,6 +28,10 @@ namespace DynamicHostileTerritories.Services
         private DateTime _lastTierCheckUtc;
         private bool _reinforced;
 
+        private readonly Random _rng = new Random();
+        private bool _skirmishTriggered;
+        private DateTime _nextSkirmishCheckUtc;
+
         public EncounterState State => _state;
 
         public EncounterDirector(PluginSettings settings, HostilityCalculator hostility, GangSpawnManager spawnManager)
@@ -43,6 +47,8 @@ namespace DynamicHostileTerritories.Services
             _enteredUtc = DateTime.UtcNow;
             _lastTierCheckUtc = _enteredUtc;
             _reinforced = false;
+            _skirmishTriggered = false;
+            _nextSkirmishCheckUtc = _enteredUtc.AddSeconds(20);
 
             _tier = _hostility.Evaluate(territory);
             territory.Hostility = _tier;
@@ -62,6 +68,9 @@ namespace DynamicHostileTerritories.Services
         {
             if (_territory == null || _tier == HostilityLevel.Pacified)
                 return;
+
+            _spawnManager.UpdateSkirmish();
+            MaybeTriggerSkirmish(territory);
 
             RecheckTierIfDue(territory);
 
@@ -83,6 +92,20 @@ namespace DynamicHostileTerritories.Services
                 Logger.Info("Escalation at " + territory.Name + " -> " + _state + ".");
                 NotifyEscalation(territory, _state);
             }
+
+            // When a turf's war is all but lost, the last men standing give up so the
+            // player can cuff them instead of having to kill every last one.
+            if (_state == EncounterState.War)
+            {
+                int left = _spawnManager.LivingFighters;
+                if (left > 0 && left <= 2 && _spawnManager.Surrender())
+                {
+                    Logger.Info("Surrender at " + territory.Name + " (" + left + " left).");
+                    Game.DisplayNotification("~o~" + territory.ControllingGang.Name
+                        + "~w~ are giving up — cuff them.");
+                }
+            }
+
         }
 
         public void End()
@@ -100,6 +123,30 @@ namespace DynamicHostileTerritories.Services
             _reinforced = false;
             _spawnManager.Deactivate();
             Logger.Info("Encounter force-pacified.");
+        }
+
+        /// <summary>
+        /// Occasionally lets a rival crew invade a busy turf, once per visit, while the
+        /// gang isn't already locked onto the player.
+        /// </summary>
+        private void MaybeTriggerSkirmish(Territory territory)
+        {
+            if (_skirmishTriggered || _tier < HostilityLevel.Aggressive)
+                return;
+            if ((int)_state > (int)EncounterState.Suspicious)
+                return;
+            if (DateTime.UtcNow < _nextSkirmishCheckUtc)
+                return;
+
+            if (_rng.NextDouble() < 0.35)
+            {
+                if (_spawnManager.TriggerSkirmish(territory))
+                    _skirmishTriggered = true;
+            }
+            else
+            {
+                _nextSkirmishCheckUtc = DateTime.UtcNow.AddSeconds(20);
+            }
         }
 
         private void RecheckTierIfDue(Territory territory)
