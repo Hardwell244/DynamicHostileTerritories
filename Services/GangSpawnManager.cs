@@ -382,6 +382,8 @@ namespace DynamicHostileTerritories.Services
 
             Ped player = Game.LocalPlayer.Character;
 
+            if (player == null || !player.Exists() || !player.IsAlive) return;
+
             // For the Provoked ambush: mobile members (patrol/loiter) peel off to encircle
             // the player from different bearings while the posted ones hold the core.
             int flankTotal = 0;
@@ -526,7 +528,14 @@ namespace DynamicHostileTerritories.Services
 
             try
             {
-                Vehicle vehicle = new Vehicle(model, pos);
+                Model vModel = new Model(model);
+                if (!vModel.IsValid)
+                {
+                    Logger.Warn("Roadblock vehicle model '" + model + "' is invalid.");
+                    return false;
+                }
+
+                Vehicle vehicle = new Vehicle(vModel, pos);
                 if (!vehicle.Exists())
                 {
                     Logger.Warn("Roadblock vehicle model '" + model + "' did not materialise.");

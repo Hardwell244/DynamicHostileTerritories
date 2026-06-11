@@ -214,14 +214,16 @@ namespace DynamicHostileTerritories.Services
         {
             foreach (Ped ped in _spawnManager.SpawnedPeds)
             {
-                if (!ped.Exists() || _countedNeutralised.Contains(ped))
+                // SE O NPC FOI DELETADO PELO JOGO NO MEIO DO CAMINHO, PULA ELE PARA NÃO CRASHAR
+                if (ped == null || !ped.Exists())
                     continue;
 
-                bool neutralised = ped.IsDead || Functions.IsPedArrested(ped);
-                if (!neutralised)
+                if (_countedNeutralised.Contains(ped))
                     continue;
 
-                _countedNeutralised.Add(ped);
+                if (ped.IsDead || Functions.IsPedArrested(ped))
+
+                    _countedNeutralised.Add(ped);
 
                 territory.Strength = Math.Max(0f, territory.Strength - _settings.PoliceActionStrengthDrop);
                 territory.LastPoliceActionUtc = now;

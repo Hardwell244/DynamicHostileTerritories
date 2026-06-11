@@ -53,15 +53,16 @@ namespace DynamicHostileTerritories.Services
             _tier = _hostility.Evaluate(territory);
             territory.Hostility = _tier;
 
-            _spawnManager.Activate(territory, _tier);
-
-            // Always arrive to a living, occupied turf; reaction comes once they notice you.
-            _state = EncounterState.Observing;
-            _spawnManager.ApplyPosture(_state, _tier);
-
+            // 1. MOVA A NOTIFICAÇÃO E O LOG PARA CÁ! (Avisa o jogador na hora)
             Logger.Info("Encounter begin at " + territory.Name + " — tier " + _tier
                 + ", strength " + (int)territory.Strength + "%, ambient presence staged.");
             NotifyEntering(territory, _tier);
+
+            // 2. Agora sim ele vai gerar os NPCs com calma
+            _spawnManager.Activate(territory, _tier);
+
+            _state = EncounterState.Observing;
+            _spawnManager.ApplyPosture(_state, _tier);
         }
 
         public void Update(Territory territory, Ped player)
@@ -171,6 +172,9 @@ namespace DynamicHostileTerritories.Services
 
         private EncounterState EvaluateState(Territory territory, Ped player)
         {
+            if (player == null || !player.Exists() || !player.IsAlive)
+                return _state;
+
             float distance = player.Position.DistanceTo(territory.Center);
             float notice = NoticeRadius(_tier);
 

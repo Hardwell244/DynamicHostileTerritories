@@ -77,6 +77,12 @@ namespace DynamicHostileTerritories.UI
                 "Paint every gang turf on the map. Bold = strong grip, faint = pacified.",
                 false
             );
+
+            // 1. Conecta a caixa de seleção à função que cria/deleta os blips no mapa
+            _blipsItem.CheckboxChanged += (sender, args) => SetBlips(_blipsItem.Checked);
+
+            // 2. Adiciona o botão de fato ao menu visível
+            _menu.Add(_blipsItem);
         }
 
         /// <summary>

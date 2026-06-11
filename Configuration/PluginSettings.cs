@@ -66,7 +66,7 @@ namespace DynamicHostileTerritories.Configuration
 
                 s.ActivationDistance = ini.ReadSingle("Performance", "ActivationDistance", 150f);
                 s.MaxSpawnedPeds = ini.ReadInt32("Performance", "MaxSpawnedPeds", 10);
-                s.UpdateIntervalMs = ini.ReadInt32("Performance", "UpdateIntervalMs", 1500);
+                s.UpdateIntervalMs = ini.ReadInt32("Performance", "UpdateIntervalMs", 750);
 
                 s.PoliceActionStrengthDrop = ini.ReadSingle("Territory", "PoliceActionStrengthDrop", 15f);
                 s.StrengthRegrowthPerHour = ini.ReadSingle("Territory", "StrengthRegrowthPerHour", 4f);
