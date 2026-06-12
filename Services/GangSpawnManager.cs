@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Drawing;
 using DynamicHostileTerritories.Core;
 using DynamicHostileTerritories.Data;
 using Rage;
@@ -26,6 +27,8 @@ namespace DynamicHostileTerritories.Services
             public Vector3 Home;
             public Role Role;
             public string Weapon;
+            public Blip Blip; // red enemy blip on the map/radar while the turf is active
+            public bool IsBoss; // area lieutenant — killing/arresting them breaks the grip
         }
 
         private static readonly string[] LoiterScenarios =
@@ -70,6 +73,11 @@ namespace DynamicHostileTerritories.Services
         private readonly int _maxPeds;
         private readonly Random _rng = new Random();
 
+        // Reuse relationship groups by name instead of creating a new one on every
+        // activation/skirmish — otherwise they pile up over a long session (leak).
+        private static readonly Dictionary<string, RelationshipGroup> _groupCache =
+            new Dictionary<string, RelationshipGroup>();
+
         private readonly List<Member> _members = new List<Member>();
         private readonly List<Ped> _peds = new List<Ped>(); // mirror, kept in sync for cleanup + police detection
         private readonly List<Vehicle> _vehicles = new List<Vehicle>();
@@ -84,8 +92,16 @@ namespace DynamicHostileTerritories.Services
         private bool _hasRoadblock;
         private bool _surrendered;
 
+        private Member _boss; // the area lieutenant, if one is present this activation
+
         public IReadOnlyList<Ped> SpawnedPeds => _peds;
         public bool IsActive => _isActive;
+
+        /// <summary>The living area lieutenant ped, or null if there isn't one.</summary>
+        public Ped BossPed
+        {
+            get { return (_boss != null && _boss.Ped != null && _boss.Ped.Exists()) ? _boss.Ped : null; }
+        }
 
         public GangSpawnManager(int maxPeds)
         {
@@ -114,26 +130,32 @@ namespace DynamicHostileTerritories.Services
                 return;
             }
 
-            _gangGroup = new RelationshipGroup("DHT_" + territory.ControllingGang.Name);
+            _gangGroup = Group("DHT_" + territory.ControllingGang.Name);
             _gangGroup.SetRelationshipWith(_gangGroup, Relationship.Companion); // same crew — never shoot each other
+            AllyWithAmbientGang(territory.ControllingGang.Name);                 // don't fight the game's own gang of the same kind
             _hasGangGroup = true;
 
             int desired = Math.Min(PedCountFor(tier), _maxPeds);
+
+            // An area lieutenant takes one slot at Aggressive+ so we never blow the cap.
+            bool wantBoss = tier >= HostilityLevel.Aggressive && desired > 0;
+            int crew = Math.Max(0, desired - (wantBoss ? 1 : 0));
+
             int guards = tier >= HostilityLevel.Warzone ? 3 : (tier >= HostilityLevel.Aggressive ? 2 : 0);
-            guards = Math.Min(guards, desired);
+            guards = Math.Min(guards, crew);
 
             if (guards > 0 && !SpawnRoadblockVehicle(territory))
                 guards = 0;
             else if (guards > 0)
                 _hasRoadblock = true;
 
-            int remaining = desired - guards;
+            int remaining = crew - guards;
             int patrols = Math.Max(1, remaining / 3);
             int sentries = remaining / 3;
             // whatever is left becomes loiterers
 
             int spawned = 0;
-            for (int i = 0; i < desired; i++)
+            for (int i = 0; i < crew; i++)
             {
                 Role role;
                 if (i < guards) role = Role.Guard;
@@ -143,7 +165,7 @@ namespace DynamicHostileTerritories.Services
 
                 Vector3 pos = (role == Role.Guard && _hasRoadblock)
                     ? RandomPointAround(_roadblockPos, 4f)
-                    : RingPoint(territory.Center, territory.Radius, i, desired);
+                    : RingPoint(territory.Center, territory.Radius, i, crew);
 
                 if (SpawnMember(pos, role, tier))
                     spawned++;
@@ -151,10 +173,21 @@ namespace DynamicHostileTerritories.Services
                 GameFiber.Sleep(100);
             }
 
+            bool bossSpawned = false;
+            if (wantBoss)
+            {
+                Vector3 bossPos = RingPoint(territory.Center, territory.Radius, 0, 1, 0.35f);
+                if (SpawnBoss(bossPos, tier))
+                {
+                    spawned++;
+                    bossSpawned = true;
+                }
+            }
+
             _isActive = true;
             Logger.Info("Activated " + territory.Name + " (" + territory.ControllingGang.Name
                 + ", tier " + tier + "): " + spawned + "/" + desired + " peds (" + patrols + " patrol, "
-                + sentries + " sentry, " + guards + " roadblock), roadblock " + _hasRoadblock + ".");
+                + sentries + " sentry, " + guards + " roadblock, boss " + bossSpawned + "), roadblock " + _hasRoadblock + ".");
         }
 
         /// <summary>
@@ -240,8 +273,8 @@ namespace DynamicHostileTerritories.Services
             if (!_isActive || _skirmishActive || _surrendered)
                 return false;
 
-            _skDefGroup = new RelationshipGroup("DHT_SkDef_" + territory.Name);
-            _skAtkGroup = new RelationshipGroup("DHT_SkAtk_" + territory.Name);
+            _skDefGroup = Group("DHT_Skirmish_Def");
+            _skAtkGroup = Group("DHT_Skirmish_Atk");
             _skDefGroup.SetRelationshipWith(_skDefGroup, Relationship.Companion);
             _skAtkGroup.SetRelationshipWith(_skAtkGroup, Relationship.Companion);
             _skDefGroup.SetRelationshipWith(_skAtkGroup, Relationship.Hate);
@@ -293,6 +326,44 @@ namespace DynamicHostileTerritories.Services
                 EndSkirmish();
         }
 
+        /// <summary>Returns a relationship group by name, creating it once and reusing it.</summary>
+        private static RelationshipGroup Group(string name)
+        {
+            if (!_groupCache.TryGetValue(name, out RelationshipGroup group))
+            {
+                group = new RelationshipGroup(name);
+                _groupCache[name] = group;
+            }
+            return group;
+        }
+
+        /// <summary>
+        /// Makes our spawned crew friendly with the game's own ambient gang of the same
+        /// kind, so the vanilla gang peds (and ours) stop shooting each other. Names that
+        /// don't exist simply create an empty group and have no effect — safe either way.
+        /// </summary>
+        private void AllyWithAmbientGang(string gangName)
+        {
+            string ambient;
+            switch (gangName)
+            {
+                case "Families": ambient = "AMBIENT_GANG_FAMILY"; break;
+                case "Ballas": ambient = "AMBIENT_GANG_BALLAS"; break;
+                case "Vagos": ambient = "AMBIENT_GANG_MEXICAN"; break;
+                case "Varrios Los Aztecas": ambient = "AMBIENT_GANG_MEXICAN"; break;
+                case "Madrazo Cartel": ambient = "AMBIENT_GANG_MEXICAN"; break;
+                case "Marabunta Grande": ambient = "AMBIENT_GANG_MARABUNTE"; break;
+                case "Kkangpae": ambient = "AMBIENT_GANG_KOREAN"; break;
+                case "The Lost MC": ambient = "AMBIENT_GANG_LOST"; break;
+                case "Rednecks": ambient = "AMBIENT_GANG_HILLBILLY"; break;
+                default: return; // Armenian Mob etc. have no clean vanilla group — skip.
+            }
+
+            RelationshipGroup ambientGroup = Group(ambient);
+            _gangGroup.SetRelationshipWith(ambientGroup, Relationship.Companion);
+            ambientGroup.SetRelationshipWith(_gangGroup, Relationship.Companion);
+        }
+
         private List<Ped> SpawnSkirmishSide(IReadOnlyList<string> models, RelationshipGroup group, Vector3 around, int count)
         {
             List<Ped> list = new List<Ped>();
@@ -341,13 +412,37 @@ namespace DynamicHostileTerritories.Services
             _skirmishActive = false;
         }
 
+        /// <summary>
+        /// Removes the map blip from any member that has died or despawned, so a dead
+        /// enemy's blip disappears immediately instead of lingering until Deactivate.
+        /// The dead ped itself stays in the list so the controller can still credit the kill.
+        /// </summary>
+        public void PruneDeadBlips()
+        {
+            foreach (Member m in _members)
+            {
+                if (m.Blip == null)
+                    continue;
+
+                bool gone = !m.Ped.Exists() || m.Ped.IsDead;
+                if (gone)
+                {
+                    if (m.Blip.Exists()) m.Blip.Delete();
+                    m.Blip = null;
+                }
+            }
+        }
+
         public void Deactivate()
         {
             int peds = _peds.Count;
             EndSkirmish();
 
             foreach (Member m in _members)
+            {
+                if (m.Blip != null && m.Blip.Exists()) m.Blip.Delete();
                 if (m.Ped.Exists()) m.Ped.Delete();
+            }
             _members.Clear();
             _peds.Clear();
 
@@ -355,6 +450,7 @@ namespace DynamicHostileTerritories.Services
                 if (v.Exists()) v.Delete();
             _vehicles.Clear();
 
+            _boss = null;
             _hasGangGroup = false;
             _hasRoadblock = false;
             _surrendered = false;
@@ -516,9 +612,111 @@ namespace DynamicHostileTerritories.Services
             ApplyStats(ped, tier);
             ped.Inventory.GiveNewWeapon(weapon, -1, false); // holstered until staged/alerted
 
-            _members.Add(new Member { Ped = ped, Home = spawnPos, Role = role, Weapon = weapon });
+            Blip blip = null;
+            try
+            {
+                blip = new Blip(ped)
+                {
+                    Color = Color.Red,
+                    Scale = 0.7f,
+                    Name = "Gang member"
+                };
+                NativeFunction.Natives.SET_BLIP_AS_SHORT_RANGE(blip, true); // only shows when near, keeps the map clean
+            }
+            catch { /* a blip failure must never stop a spawn */ }
+
+            _members.Add(new Member { Ped = ped, Home = spawnPos, Role = role, Weapon = weapon, Blip = blip });
             _peds.Add(ped);
             return true;
+        }
+
+        /// <summary>
+        /// Spawns the area lieutenant: a tougher, well-armed boss using the gang's boss/
+        /// lieutenant model when it has one, with a gold blip that stays on the map. The
+        /// controller treats this ped specially — neutralising them craters the grip.
+        /// </summary>
+        private bool SpawnBoss(Vector3 around, HostilityLevel tier)
+        {
+            string model = PickBossModel(_territory.ControllingGang.PedModels);
+
+            Vector3 spawnPos = around;
+            if (NativeFunction.Natives.GET_SAFE_COORD_FOR_PED<bool>(around.X, around.Y, around.Z, true, out Vector3 safe, 0))
+                spawnPos = safe;
+
+            Ped ped;
+            try
+            {
+                ped = new Ped(model, spawnPos, _rng.Next(0, 360));
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn("Failed to spawn boss model '" + model + "': " + ex.Message);
+                return false;
+            }
+
+            if (!ped.Exists())
+            {
+                Logger.Warn("Boss model '" + model + "' did not materialise (invalid model?).");
+                return false;
+            }
+
+            const string bossWeapon = "weapon_carbinerifle";
+
+            ped.IsPersistent = true;
+            ped.BlockPermanentEvents = true;
+            ped.RelationshipGroup = _gangGroup;
+            ped.Accuracy = 80;
+            ped.Armor = 100;
+            ped.MaxHealth = 400;
+            ped.Health = 400;
+            ped.Inventory.GiveNewWeapon(bossWeapon, -1, false);
+
+            Blip blip = null;
+            try
+            {
+                blip = new Blip(ped)
+                {
+                    Color = Color.Gold,
+                    Scale = 1.0f,
+                    Name = _territory.ControllingGang.Name + " Lieutenant"
+                };
+                // Boss stays visible on the map at any distance (not short-range) so the
+                // player can hunt the priority target.
+            }
+            catch { /* a blip failure must never stop a spawn */ }
+
+            Member boss = new Member
+            {
+                Ped = ped,
+                Home = spawnPos,
+                Role = Role.Sentry,
+                Weapon = bossWeapon,
+                Blip = blip,
+                IsBoss = true
+            };
+
+            _members.Add(boss);
+            _peds.Add(ped);
+            _boss = boss;
+
+            Logger.Info("Area lieutenant spawned at " + _territory.Name + " (" + _territory.ControllingGang.Name + ").");
+            return true;
+        }
+
+        /// <summary>Prefers a boss/lieutenant model if the gang defines one, else any model.</summary>
+        private string PickBossModel(IReadOnlyList<string> models)
+        {
+            if (models == null || models.Count == 0)
+                return "g_m_m_armboss_01"; // safe generic fallback
+
+            foreach (string m in models)
+            {
+                if (m.IndexOf("boss", StringComparison.OrdinalIgnoreCase) >= 0
+                    || m.IndexOf("lieut", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return m;
+            }
+
+            return models[_rng.Next(models.Count)];
         }
 
         private bool SpawnRoadblockVehicle(Territory territory)
@@ -596,23 +794,24 @@ namespace DynamicHostileTerritories.Services
 
             _gangGroup.SetRelationshipWith(player, rel);
             _gangGroup.SetRelationshipWith(cops, rel);
-
-            if (state == EncounterState.War)
-            {
-                player.SetRelationshipWith(_gangGroup, Relationship.Hate);
-                cops.SetRelationshipWith(_gangGroup, Relationship.Hate);
-            }
+            // Set the reverse direction too, so leaving war / leaving the turf actually
+            // clears the hostility on the cached group instead of leaving cops/player
+            // permanently hating this gang.
+            player.SetRelationshipWith(_gangGroup, rel);
+            cops.SetRelationshipWith(_gangGroup, rel);
         }
 
         // --- Helpers ----------------------------------------------------------------------
 
-        private static int PedCountFor(HostilityLevel tier)
+        private int PedCountFor(HostilityLevel tier)
         {
+            // Scales with MaxSpawnedPeds from the .ini, so raising the cap raises the
+            // whole presence. Warzone fills the cap; weaker tiers are intentionally lighter.
             switch (tier)
             {
-                case HostilityLevel.Watchful: return 6;
-                case HostilityLevel.Aggressive: return 12;
-                case HostilityLevel.Warzone: return 18;
+                case HostilityLevel.Watchful: return Math.Max(3, _maxPeds / 3);        // ~1/3 of the cap
+                case HostilityLevel.Aggressive: return Math.Max(6, (_maxPeds * 2) / 3); // ~2/3 of the cap
+                case HostilityLevel.Warzone: return _maxPeds;                          // full cap
                 default: return 0;
             }
         }

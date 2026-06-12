@@ -17,6 +17,15 @@ namespace DynamicHostileTerritories.Services
     /// </summary>
     public sealed class EncounterDirector
     {
+        // The per-visit "mood" of a turf, rolled on entry so encounters feel organic
+        // instead of always escalating the same way.
+        private enum EncounterProfile
+        {
+            Quiet,   // armed presence, but they won't open fire unless the player does
+            Tense,   // they'll aim up / encircle if you push, but don't fire first
+            Hostile  // ambush — they can open fire just for being here
+        }
+
         private readonly PluginSettings _settings;
         private readonly HostilityCalculator _hostility;
         private readonly GangSpawnManager _spawnManager;
@@ -27,10 +36,12 @@ namespace DynamicHostileTerritories.Services
         private DateTime _enteredUtc;
         private DateTime _lastTierCheckUtc;
         private bool _reinforced;
+        private EncounterProfile _profile;
 
         private readonly Random _rng = new Random();
-        private bool _skirmishTriggered;
-        private DateTime _nextSkirmishCheckUtc;
+        private readonly AmbientEventDirector _events;
+        private bool _eventTriggered;
+        private DateTime _nextEventCheckUtc;
 
         public EncounterState State => _state;
 
@@ -39,6 +50,7 @@ namespace DynamicHostileTerritories.Services
             _settings = settings;
             _hostility = hostility;
             _spawnManager = spawnManager;
+            _events = new AmbientEventDirector(_rng);
         }
 
         public void Begin(Territory territory)
@@ -47,16 +59,17 @@ namespace DynamicHostileTerritories.Services
             _enteredUtc = DateTime.UtcNow;
             _lastTierCheckUtc = _enteredUtc;
             _reinforced = false;
-            _skirmishTriggered = false;
-            _nextSkirmishCheckUtc = _enteredUtc.AddSeconds(20);
+            _eventTriggered = false;
+            _nextEventCheckUtc = _enteredUtc.AddSeconds(20);
 
             _tier = _hostility.Evaluate(territory);
             territory.Hostility = _tier;
+            _profile = RollProfile(_tier);
 
             // 1. MOVA A NOTIFICAÇÃO E O LOG PARA CÁ! (Avisa o jogador na hora)
             Logger.Info("Encounter begin at " + territory.Name + " — tier " + _tier
-                + ", strength " + (int)territory.Strength + "%, ambient presence staged.");
-            NotifyEntering(territory, _tier);
+                + ", mood " + _profile + ", strength " + (int)territory.Strength + "%, ambient presence staged.");
+            NotifyEntering(territory, _tier, _profile);
 
             // 2. Agora sim ele vai gerar os NPCs com calma
             _spawnManager.Activate(territory, _tier);
@@ -71,7 +84,10 @@ namespace DynamicHostileTerritories.Services
                 return;
 
             _spawnManager.UpdateSkirmish();
-            MaybeTriggerSkirmish(territory);
+            _spawnManager.PruneDeadBlips();
+            _events.Update();
+
+            MaybeTriggerAmbientEvent(territory);
 
             RecheckTierIfDue(territory);
 
@@ -111,6 +127,7 @@ namespace DynamicHostileTerritories.Services
 
         public void End()
         {
+            _events.End();
             _spawnManager.Deactivate();
             _territory = null;
             _state = EncounterState.Observing;
@@ -127,26 +144,34 @@ namespace DynamicHostileTerritories.Services
         }
 
         /// <summary>
-        /// Occasionally lets a rival crew invade a busy turf, once per visit, while the
-        /// gang isn't already locked onto the player.
+        /// Once per visit, while the gang isn't yet locked onto the player, there's a
+        /// chance something kicks off in the turf: either a rival crew rolls in for a
+        /// skirmish, or a street event (deal / mugging / execution) plays out.
         /// </summary>
-        private void MaybeTriggerSkirmish(Territory territory)
+        private void MaybeTriggerAmbientEvent(Territory territory)
         {
-            if (_skirmishTriggered || _tier < HostilityLevel.Aggressive)
+            if (_eventTriggered || _tier < HostilityLevel.Aggressive)
                 return;
             if ((int)_state > (int)EncounterState.Suspicious)
                 return;
-            if (DateTime.UtcNow < _nextSkirmishCheckUtc)
+            if (DateTime.UtcNow < _nextEventCheckUtc)
                 return;
 
-            if (_rng.NextDouble() < 0.35)
+            if (_rng.NextDouble() < 0.4)
             {
-                if (_spawnManager.TriggerSkirmish(territory))
-                    _skirmishTriggered = true;
+                // Coin-flip between a turf war and a street event.
+                bool started = (_rng.Next(0, 2) == 0)
+                    ? _spawnManager.TriggerSkirmish(territory)
+                    : _events.TryStart(territory);
+
+                if (started)
+                    _eventTriggered = true;
+                else
+                    _nextEventCheckUtc = DateTime.UtcNow.AddSeconds(20);
             }
             else
             {
-                _nextSkirmishCheckUtc = DateTime.UtcNow.AddSeconds(20);
+                _nextEventCheckUtc = DateTime.UtcNow.AddSeconds(20);
             }
         }
 
@@ -175,27 +200,62 @@ namespace DynamicHostileTerritories.Services
             if (player == null || !player.Exists() || !player.IsAlive)
                 return _state;
 
+            // The player drawing blood (or a downed member) tips ANY block into open war.
+            if (player.IsShooting || territory.RecentHeat >= 60f)
+                return EncounterState.War;
+
             float distance = player.Position.DistanceTo(territory.Center);
             float notice = NoticeRadius(_tier);
+            double dwellSeconds = (DateTime.UtcNow - _enteredUtc).TotalSeconds;
 
             EncounterState desired = EncounterState.Observing;
 
-            double dwellSeconds = (DateTime.UtcNow - _enteredUtc).TotalSeconds;
+            // Being noticed (lingering, or inside the notice radius) makes them watch you.
             if (dwellSeconds >= _settings.SuspicionDelaySeconds || distance <= notice)
                 desired = EncounterState.Suspicious;
 
-            if (NativeFunction.Natives.IS_PED_ARMED<bool>(player, 7) || distance <= notice * 0.6f)
+            // A tense/hostile block aims up or encircles when you get close or go armed.
+            if (_profile != EncounterProfile.Quiet
+                && (NativeFunction.Natives.IS_PED_ARMED<bool>(player, 7) || distance <= notice * 0.6f))
                 desired = Max(desired, EncounterState.Provoked);
 
-            // A high-tier turf doesn't stay merely "suspicious" once it has clocked you.
-            if (_tier >= HostilityLevel.Warzone && (int)desired >= (int)EncounterState.Suspicious)
-                desired = Max(desired, EncounterState.Provoked);
-
-            // A drawn shot or a downed member tips the whole block into open war.
-            if (player.IsShooting || territory.RecentHeat >= 60f)
-                desired = EncounterState.War;
+            // Only a hostile block opens fire just for you being here — the ambush/fatal entry.
+            if (_profile == EncounterProfile.Hostile && distance <= notice * 0.5f)
+                desired = Max(desired, EncounterState.War);
 
             return desired;
+        }
+
+        /// <summary>
+        /// Rolls the per-visit mood. Weak turfs are usually quiet; strong turfs and the
+        /// night lean hostile — but every tier keeps a real chance of "nothing happens"
+        /// and of an ambush, so no two visits feel scripted.
+        /// </summary>
+        private EncounterProfile RollProfile(HostilityLevel tier)
+        {
+            double quiet, tense; // hostile = the remainder
+
+            switch (tier)
+            {
+                case HostilityLevel.Warzone: quiet = 0.20; tense = 0.40; break;
+                case HostilityLevel.Aggressive: quiet = 0.35; tense = 0.45; break;
+                default: quiet = 0.55; tense = 0.40; break;
+            }
+
+            // Night makes the streets meaner: shift weight out of quiet into hostile.
+            if (IsNight())
+                quiet = Math.Max(0.05, quiet - 0.15);
+
+            double roll = _rng.NextDouble();
+            if (roll < quiet) return EncounterProfile.Quiet;
+            if (roll < quiet + tense) return EncounterProfile.Tense;
+            return EncounterProfile.Hostile;
+        }
+
+        private static bool IsNight()
+        {
+            int hour = World.TimeOfDay.Hours;
+            return hour >= 20 || hour < 6;
         }
 
         /// <summary>
@@ -217,14 +277,14 @@ namespace DynamicHostileTerritories.Services
             return (int)a >= (int)b ? a : b;
         }
 
-        private static void NotifyEntering(Territory territory, HostilityLevel tier)
+        private static void NotifyEntering(Territory territory, HostilityLevel tier, EncounterProfile profile)
         {
             string mood;
-            switch (tier)
+            switch (profile)
             {
-                case HostilityLevel.Warzone: mood = "~r~Armed and they want you gone."; break;
-                case HostilityLevel.Aggressive: mood = "~o~Armed crew holding the block."; break;
-                default: mood = "~y~Locals are watching you."; break;
+                case EncounterProfile.Hostile: mood = "~r~Something feels wrong here."; break;
+                case EncounterProfile.Tense: mood = "~o~Armed crew, eyes on you."; break;
+                default: mood = "~y~Quiet for now — stay sharp."; break;
             }
 
             Game.DisplayNotification(

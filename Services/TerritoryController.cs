@@ -5,6 +5,7 @@ using DynamicHostileTerritories.Core;
 using DynamicHostileTerritories.Data;
 using LSPD_First_Response.Mod.API;
 using Rage;
+using Rage.Native;
 
 namespace DynamicHostileTerritories.Services
 {
@@ -24,8 +25,12 @@ namespace DynamicHostileTerritories.Services
 
         private readonly HashSet<Ped> _countedNeutralised = new HashSet<Ped>();
 
+        // Taking out the area lieutenant breaks the gang's hold far harder than a grunt.
+        private const float BossNeutralizedStrengthDrop = 50f;
+
         private GameFiber _loop;
         private bool _running;
+        private int _generation;
         private Territory _activeTerritory;
         private DateTime _lastTickUtc;
         private DateTime _lastSaveUtc;
@@ -54,7 +59,9 @@ namespace DynamicHostileTerritories.Services
             _running = true;
             _lastTickUtc = DateTime.UtcNow;
             _lastSaveUtc = DateTime.UtcNow;
-            _loop = GameFiber.StartNew(Loop);
+
+            int generation = ++_generation;
+            _loop = GameFiber.StartNew(() => Loop(generation));
 
             Logger.Info("Territory controller started. Watching " + _repository.Territories.Count + " territories.");
         }
@@ -65,22 +72,21 @@ namespace DynamicHostileTerritories.Services
                 return;
 
             _running = false;
+            _generation++; // invalidate the running loop so it ends itself at the next slice
 
             _director.End();
             _activeTerritory = null;
             _countedNeutralised.Clear();
             _stateStore.Save(_repository.Territories);
 
-            if (_loop != null && _loop.IsAlive)
-                _loop.Abort();
-            _loop = null;
+            _loop = null; // no Abort — never interrupt a tick mid-spawn/save
 
             Logger.Info("Territory controller stopped.");
         }
 
-        private void Loop()
+        private void Loop(int generation)
         {
-            while (_running)
+            while (_running && generation == _generation)
             {
                 try
                 {
@@ -91,7 +97,13 @@ namespace DynamicHostileTerritories.Services
                     Logger.Error("Controller tick error", ex);
                 }
 
-                GameFiber.Sleep(_settings.UpdateIntervalMs);
+                // Sleep in small slices so Stop() is honoured promptly and we never Abort.
+                int slept = 0;
+                while (slept < _settings.UpdateIntervalMs && _running && generation == _generation)
+                {
+                    GameFiber.Sleep(100);
+                    slept += 100;
+                }
             }
         }
 
@@ -212,38 +224,70 @@ namespace DynamicHostileTerritories.Services
 
         private void DetectPoliceActions(Territory territory, DateTime now)
         {
+            Ped player = Game.LocalPlayer.Character;
+            bool playerOk = player.Exists();
+            Ped bossPed = _spawnManager.BossPed;
+
             foreach (Ped ped in _spawnManager.SpawnedPeds)
             {
-                // SE O NPC FOI DELETADO PELO JOGO NO MEIO DO CAMINHO, PULA ELE PARA NÃO CRASHAR
+                // Trava de segurança que adicionamos:
                 if (ped == null || !ped.Exists())
                     continue;
 
                 if (_countedNeutralised.Contains(ped))
                     continue;
 
-                if (ped.IsDead || Functions.IsPedArrested(ped))
-
-                    _countedNeutralised.Add(ped);
-
-                territory.Strength = Math.Max(0f, territory.Strength - _settings.PoliceActionStrengthDrop);
-                territory.LastPoliceActionUtc = now;
-                territory.RecentHeat = 100f;
-
-                // Grudge: hit one of a gang's turfs and the whole gang gets angrier —
-                // their other territories heat up and tier up the next time you roll in.
-                foreach (Territory other in _repository.Territories)
+                // SÓ conta se VOCÊ neutralizou: preso, OU morto por dano causado por você.
+                // Assim morte por fogo amigo / skirmish / queda NÃO derruba o grip sozinha.
+                bool arrested = Functions.IsPedArrested(ped);
+                // DEPOIS
+                bool killedByPlayer = false;
+                if (ped.IsDead && playerOk)
                 {
-                    if (other == territory)
-                        continue;
-                    if (other.ControllingGang == territory.ControllingGang)
-                        other.RecentHeat = Math.Min(100f, other.RecentHeat + 25f);
+                    // GET_PED_SOURCE_OF_DEATH returns the entity that killed the ped; compare
+                    // its handle to the player's. (RPH Ped has no .Killer, and
+                    // HAS_ENTITY_BEEN_DAMAGED_BY_ENTITY proved flaky — kept only as a backup.)
+                    int killerHandle = NativeFunction.Natives.GET_PED_SOURCE_OF_DEATH<int>(ped);
+                    int playerHandle = NativeFunction.Natives.PLAYER_PED_ID<int>();
+                    killedByPlayer = (killerHandle != 0 && killerHandle == playerHandle)
+                        || NativeFunction.Natives.HAS_ENTITY_BEEN_DAMAGED_BY_ENTITY<bool>(ped, player, true);
                 }
 
-                Game.DisplayNotification(
-                    "~g~Police pressure~w~ in ~y~" + territory.Name
-                    + "~w~. " + territory.ControllingGang.Name + " grip: " + (int)territory.Strength + "%.");
+                if (arrested || killedByPlayer)
+                {
+                    _countedNeutralised.Add(ped);
 
-                Logger.Info("Police action in " + territory.Name + " -> strength " + (int)territory.Strength + "%.");
+                    bool isBoss = bossPed != null && ped == bossPed;
+                    float drop = isBoss ? BossNeutralizedStrengthDrop : _settings.PoliceActionStrengthDrop;
+
+                    territory.Strength = Math.Max(0f, territory.Strength - drop);
+                    territory.LastPoliceActionUtc = now;
+                    territory.RecentHeat = 100f;
+
+                    // Grudge: hit one of a gang's turfs and the whole gang gets angrier
+                    foreach (Territory other in _repository.Territories)
+                    {
+                        if (other == territory)
+                            continue;
+                        if (other.ControllingGang == territory.ControllingGang)
+                            other.RecentHeat = Math.Min(100f, other.RecentHeat + (isBoss ? 40f : 25f));
+                    }
+
+                    if (isBoss)
+                    {
+                        Game.DisplayNotification(
+                            "~r~Lieutenant down!~w~ " + territory.ControllingGang.Name
+                            + "'s hold on ~y~" + territory.Name + "~w~ is breaking. Grip: " + (int)territory.Strength + "%.");
+                        Logger.Info("BOSS neutralised in " + territory.Name + " -> strength " + (int)territory.Strength + "%.");
+                    }
+                    else
+                    {
+                        Game.DisplayNotification(
+                            "~g~Police pressure~w~ in ~y~" + territory.Name
+                            + "~w~. " + territory.ControllingGang.Name + " grip: " + (int)territory.Strength + "%.");
+                        Logger.Info("Police action in " + territory.Name + " -> strength " + (int)territory.Strength + "%.");
+                    }
+                }
             }
         }
 

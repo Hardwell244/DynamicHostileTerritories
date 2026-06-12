@@ -12,7 +12,7 @@ namespace DynamicHostileTerritories.Data
     {
         // --- Static definition: set on creation, never changes at runtime. ---
         public string Name { get; }
-        public Gang ControllingGang { get; }
+        public Gang ControllingGang { get; set; }
         public Vector3 Center { get; }
         public float Radius { get; }
 

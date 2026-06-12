@@ -26,6 +26,7 @@ namespace DynamicHostileTerritories.UI
         private readonly PluginSettings _settings;
         private readonly TerritoryController _controller;
         private readonly TerritoryRepository _repository;
+        private readonly GangWarfareDirector _warfare;
 
         private readonly ObjectPool _pool = new ObjectPool();
         private readonly Dictionary<Territory, Blip> _blips = new Dictionary<Territory, Blip>();
@@ -37,11 +38,12 @@ namespace DynamicHostileTerritories.UI
         private NativeItem _controlItem;
         private NativeCheckboxItem _blipsItem;
 
-        public InteractionMenu(PluginSettings settings, TerritoryController controller, TerritoryRepository repository)
+        public InteractionMenu(PluginSettings settings, TerritoryController controller, TerritoryRepository repository, GangWarfareDirector warfare)
         {
             _settings = settings;
             _controller = controller;
             _repository = repository;
+            _warfare = warfare;
             BuildMenu();
         }
 
@@ -164,10 +166,16 @@ namespace DynamicHostileTerritories.UI
                 int held = gc.Total - gc.Pacified;
                 int avgGrip = gc.Total > 0 ? (int)(gc.GripSum / gc.Total) : 0;
 
+                GangWarfareDirector.PowerInfo info = _warfare != null
+                    ? _warfare.GetPower(kv.Key)
+                    : new GangWarfareDirector.PowerInfo();
+
                 NativeItem item = new NativeItem(kv.Key.Name,
-                    "Average grip " + avgGrip + "%. " + gc.Pacified + " of " + gc.Total + " turfs pacified.")
+                    "Average grip " + avgGrip + "%. " + gc.Pacified + " of " + gc.Total + " turfs pacified."
+                    + " War chest — money " + (int)info.Money + ", influence " + (int)info.Influence
+                    + ", weapons " + (int)info.Weapons + ".")
                 {
-                    AltTitle = held + "/" + gc.Total + " held",
+                    AltTitle = held + "/" + gc.Total + " held  |  PWR " + (int)info.Power,
                     Enabled = false
                 };
                 _controlMenu.Add(item);
@@ -185,7 +193,7 @@ namespace DynamicHostileTerritories.UI
 
                 foreach (Territory t in _repository.Territories)
                 {
-                    Blip blip = new Blip(t.Center, t.Radius)
+                    Blip blip = new Blip(t.Center, _settings.ActivationDistance)
                     {
                         Color = t.ControllingGang.BlipColor
                     };

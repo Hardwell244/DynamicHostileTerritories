@@ -199,7 +199,7 @@ namespace DynamicHostileTerritories.Services
                         new[] { "kuruma", "sultan", "dilettante" }),
 
                     G("Armenian Mob", 139, 0, 0,
-                        new[] { "g_m_m_armboss_01", "g_m_m_armlieut_01", "g_m_y_armgoon_01", "g_m_y_armgoon_02" },
+                        new[] { "g_m_m_armboss_01", "g_m_m_armlieut_01", "g_m_y_armgoon_02" },
                         new[] { "schafter2", "oracle", "cognoscenti" }),
 
                     G("Madrazo Cartel", 255, 165, 0,

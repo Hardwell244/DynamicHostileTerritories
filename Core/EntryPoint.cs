@@ -24,9 +24,11 @@ namespace DynamicHostileTerritories.Core
         private GangSpawnManager _spawnManager;
         private EncounterDirector _director;
         private TerritoryController _controller;
+        private GangWarfareDirector _warfare;
         private InteractionMenu _menu;
 
         private GameFiber _inputFiber;
+        private int _inputGen;
         private bool _onDuty;
 
         public override void Initialize()
@@ -51,7 +53,8 @@ namespace DynamicHostileTerritories.Core
                 _spawnManager = new GangSpawnManager(_settings.MaxSpawnedPeds);
                 _director = new EncounterDirector(_settings, _hostility, _spawnManager);
                 _controller = new TerritoryController(_settings, _repository, _director, _spawnManager, _stateStore);
-                _menu = new InteractionMenu(_settings, _controller, _repository);
+                _warfare = new GangWarfareDirector(_repository, _controller);
+                _menu = new InteractionMenu(_settings, _controller, _repository, _warfare);
 
                 Functions.OnOnDutyStateChanged += OnOnDutyStateChanged;
                 Logger.Info("Loaded with " + _repository.Territories.Count + " territories. Waiting for on-duty.");
@@ -84,7 +87,10 @@ namespace DynamicHostileTerritories.Core
 
             _onDuty = true;
             _controller.Start();
-            _inputFiber = GameFiber.StartNew(InputLoop);
+            _warfare?.Start();
+
+            int gen = ++_inputGen;
+            _inputFiber = GameFiber.StartNew(() => InputLoop(gen));
             GameFiber.StartNew(ShowWelcomeNotification);
 
             Logger.Info("Player went on duty. Systems online.");
@@ -93,18 +99,17 @@ namespace DynamicHostileTerritories.Core
         private void Shutdown()
         {
             _onDuty = false;
-
-            if (_inputFiber != null && _inputFiber.IsAlive)
-                _inputFiber.Abort();
-            _inputFiber = null;
+            _inputGen++;        // invalidate the running input loop so it ends on its own
+            _inputFiber = null; // no Abort — the loop sees the flag/generation and exits
 
             _menu?.Dispose();
+            _warfare?.Stop();
             _controller?.Stop();
         }
 
-        private void InputLoop()
+        private void InputLoop(int generation)
         {
-            while (_onDuty)
+            while (_onDuty && generation == _inputGen)
             {
                 try
                 {
