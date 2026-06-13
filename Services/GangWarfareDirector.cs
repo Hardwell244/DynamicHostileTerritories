@@ -37,13 +37,24 @@ namespace DynamicHostileTerritories.Services
 
         // Tunables (kept in code for now; can move to the .ini later).
         private const double CycleSeconds = 35.0;             // how often the meta-cycle runs
-        private const double ConquestSuppressionMinutes = 3.0; // post-police truce on a turf
+        private const double ConquestSuppressionMinutes = 15.0; // post-police truce on a turf
         private const double ReclaimPowerCost = 18.0;         // power to push a held turf back up
         private const float ReclaimStrengthGain = 8f;
         private const double ConquerPowerCost = 120.0;        // power to flip a turf
         private const float ConquerSeedStrength = 45f;        // strength the new owner starts with
         private const float WeakTurfThreshold = 30f;          // a turf this weak is a conquest target
         private const double ConquerChance = 0.5;             // chance a capable gang expands per cycle
+
+        // Gang-vs-gang warfare: strong gangs raid rival turf along their front line,
+        // wearing it down over several cycles until it's weak enough to storm.
+        private const double RaidPowerCost = 22.0;            // power a gang spends per raid
+        private const float RaidDamage = 15f;                 // strength a raid knocks off a rival turf
+        private const int MaxRaidsPerCycle = 2;               // how many raids can happen citywide per cycle
+
+        // Comeback for a wiped-out gang: it doesn't vanish — it earns a quiet underground
+        // income and claws a foothold back at a cheaper cost than a normal conquest.
+        private const double ResurgenceChipCost = 8.0;        // cheap push while landless
+        private const double ResurgenceClaimCost = 45.0;      // cheaper than a normal flip
 
         public GangWarfareDirector(TerritoryRepository repository, TerritoryController controller)
         {
@@ -122,6 +133,8 @@ namespace DynamicHostileTerritories.Services
         {
             EarnIncome();
             Reclaim();
+            WageWar();
+            Resurgence();
             Expand();
         }
 
@@ -150,6 +163,90 @@ namespace DynamicHostileTerritories.Services
                 r.Influence += 1.0;
                 r.Weapons += 0.5 + t.Strength * 0.02;
             }
+
+            // Underground income: a wiped-out gang doesn't vanish — it quietly rebuilds a
+            // war chest so it can claw a foothold back (see Resurgence).
+            HashSet<Gang> landed = ControllingGangs();
+            foreach (KeyValuePair<Gang, Resources> kv in _resources)
+            {
+                if (landed.Contains(kv.Key))
+                    continue;
+
+                kv.Value.Money += 6.0;
+                kv.Value.Influence += 4.0;
+                kv.Value.Weapons += 4.0;
+            }
+        }
+
+        /// <summary>Every gang that currently controls at least one turf.</summary>
+        private HashSet<Gang> ControllingGangs()
+        {
+            HashSet<Gang> set = new HashSet<Gang>();
+            foreach (Territory t in _repository.Territories)
+                if (t.ControllingGang != null)
+                    set.Add(t.ControllingGang);
+            return set;
+        }
+
+        /// <summary>
+        /// A gang with no turf left claws its way back: it pushes on the weakest turf in the
+        /// city (any owner) until a foothold opens, then re-establishes there at a cheaper
+        /// cost. So losing every turf is a setback, not a death — the gang returns to the map.
+        /// </summary>
+        private void Resurgence()
+        {
+            Territory active = _controller.ActiveTerritory;
+            DateTime now = DateTime.UtcNow;
+            HashSet<Gang> landed = ControllingGangs();
+
+            foreach (KeyValuePair<Gang, Resources> kv in _resources)
+            {
+                Gang gang = kv.Key;
+                if (landed.Contains(gang))
+                    continue; // still has turf — not landless
+
+                Resources r = kv.Value;
+                if (r.Power < ResurgenceChipCost)
+                    continue;
+
+                Territory target = WeakestTakeableTurf(gang, active, now);
+                if (target == null)
+                    continue;
+
+                Spend(r, ResurgenceChipCost);
+                target.Strength = Math.Max(0f, target.Strength - RaidDamage);
+                target.RecentHeat = Math.Min(100f, target.RecentHeat + 10f);
+
+                Logger.Debug(gang.Name + " (landless) is clawing back at " + target.Name
+                    + " (now " + (int)target.Strength + "%).");
+
+                if (target.Strength <= WeakTurfThreshold && r.Power >= ResurgenceClaimCost)
+                    Conquer(gang, r, target, "re-established in", ResurgenceClaimCost);
+
+                return; // one comeback push per cycle citywide
+            }
+        }
+
+        /// <summary>The weakest turf a gang can move on (any owner), skipping active/suppressed.</summary>
+        private Territory WeakestTakeableTurf(Gang gang, Territory active, DateTime now)
+        {
+            Territory best = null;
+            float bestStrength = float.MaxValue;
+
+            foreach (Territory t in _repository.Territories)
+            {
+                if (t == active || t.ControllingGang == gang)
+                    continue;
+                if (IsSuppressed(t, now))
+                    continue;
+                if (t.Strength < bestStrength)
+                {
+                    bestStrength = t.Strength;
+                    best = t;
+                }
+            }
+
+            return best;
         }
 
         /// <summary>Gangs pour power into their own weakened turf to bring it back up.</summary>
@@ -199,21 +296,113 @@ namespace DynamicHostileTerritories.Services
                 if (target == null)
                     continue;
 
-                Spend(r, ConquerPowerCost);
-
-                Gang previous = target.ControllingGang;
-                target.ControllingGang = attacker;
-                target.Strength = ConquerSeedStrength;
-                target.RecentHeat = 0f;
-                target.LastPoliceActionUtc = DateTime.MinValue;
-
-                Logger.Info("CONQUEST: " + attacker.Name + " took " + target.Name + " from " + previous.Name + ".");
-                Game.DisplayNotification(
-                    "~r~Turf war~w~: ~y~" + attacker.Name + "~w~ have taken ~o~" + target.Name
-                    + "~w~ from ~y~" + previous.Name + "~w~.");
-
-                return; // one conquest per cycle keeps the map from churning too hard
+                Conquer(attacker, r, target, "took", ConquerPowerCost);
+                return; // one opportunistic grab per cycle keeps the map from churning too hard
             }
+        }
+
+        /// <summary>
+        /// Gang-vs-gang warfare. The strongest gangs push along their front line: each picks
+        /// the rival turf closest to its own holdings and knocks its strength down. When that
+        /// turf is worn weak enough and the attacker can afford it, the raider storms and takes
+        /// it on the spot — so the map shifts on its own, independently of the player.
+        /// </summary>
+        private void WageWar()
+        {
+            Territory active = _controller.ActiveTerritory;
+            DateTime now = DateTime.UtcNow;
+
+            List<Gang> gangs = _resources.Keys.ToList();
+            gangs.Sort((a, b) => ResourcesFor(b).Power.CompareTo(ResourcesFor(a).Power));
+
+            int raids = 0;
+            foreach (Gang attacker in gangs)
+            {
+                if (raids >= MaxRaidsPerCycle)
+                    break;
+
+                Resources r = ResourcesFor(attacker);
+                if (r.Power < RaidPowerCost)
+                    continue;
+
+                Territory target = PickRaidTarget(attacker, active, now);
+                if (target == null)
+                    continue;
+
+                Spend(r, RaidPowerCost);
+                target.Strength = Math.Max(0f, target.Strength - RaidDamage);
+                target.RecentHeat = Math.Min(100f, target.RecentHeat + 10f);
+                raids++;
+
+                Logger.Debug(attacker.Name + " is pushing into " + target.Name
+                    + " (now " + (int)target.Strength + "%).");
+
+                // Worn down enough and the raider can pay for it — storm it now.
+                if (target.Strength <= WeakTurfThreshold && r.Power >= ConquerPowerCost)
+                    Conquer(attacker, r, target, "stormed", ConquerPowerCost);
+            }
+        }
+
+        /// <summary>
+        /// The rival turf closest to the attacker's own holdings (its front line), skipping
+        /// the player's active turf, turfs under a post-police truce, and turfs already weak
+        /// enough for an opportunistic grab (those are left to Expand).
+        /// </summary>
+        private Territory PickRaidTarget(Gang attacker, Territory active, DateTime now)
+        {
+            Territory best = null;
+            float bestDist = float.MaxValue;
+
+            foreach (Territory t in _repository.Territories)
+            {
+                if (t == active || t.ControllingGang == attacker)
+                    continue;
+                if (IsSuppressed(t, now))
+                    continue;
+                if (t.Strength <= WeakTurfThreshold)
+                    continue;
+
+                float d = NearestOwnedDistance(attacker, t);
+                if (d < bestDist)
+                {
+                    bestDist = d;
+                    best = t;
+                }
+            }
+
+            return best;
+        }
+
+        /// <summary>Distance from a turf to the attacker's nearest own turf (its front line).</summary>
+        private float NearestOwnedDistance(Gang gang, Territory target)
+        {
+            float best = float.MaxValue;
+            foreach (Territory t in _repository.Territories)
+            {
+                if (t.ControllingGang != gang)
+                    continue;
+                float d = t.Center.DistanceTo(target.Center);
+                if (d < best)
+                    best = d;
+            }
+            return best; // float.MaxValue if the gang owns nothing
+        }
+
+        /// <summary>Flips a turf to the attacker and seeds it at a low grip. Shared by war + expand + resurgence.</summary>
+        private void Conquer(Gang attacker, Resources r, Territory target, string verb, double cost)
+        {
+            Spend(r, cost);
+
+            Gang previous = target.ControllingGang;
+            target.ControllingGang = attacker;
+            target.Strength = ConquerSeedStrength;
+            target.RecentHeat = 0f;
+            target.LastPoliceActionUtc = DateTime.MinValue;
+
+            string body = char.ToUpper(verb[0]) + verb.Substring(1);
+            Logger.Info("CONQUEST: " + attacker.Name + " " + verb + " " + target.Name + " from " + previous.Name + ".");
+            Notifier.Show("Turf War", "~r~" + attacker.Name,
+                body + " ~o~" + target.Name + "~w~ from ~y~" + previous.Name + "~w~.");
         }
 
         /// <summary>The weakest unsuppressed turf the attacker doesn't already own.</summary>

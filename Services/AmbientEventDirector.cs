@@ -56,15 +56,15 @@ namespace DynamicHostileTerritories.Services
             {
                 case EventKind.Deal:
                     ok = StartDeal(territory, spot);
-                    label = "~g~Street deal~w~ going down in ~o~" + territory.Name + "~w~.";
+                    label = "~g~A street deal is going down.";
                     break;
                 case EventKind.Mugging:
                     ok = StartMugging(territory, spot);
-                    label = "~o~A mugging~w~ in ~o~" + territory.Name + "~w~.";
+                    label = "~o~A mugging in progress.";
                     break;
                 default:
                     ok = StartExecution(territory, spot);
-                    label = "~r~An execution~w~ is happening in ~o~" + territory.Name + "~w~.";
+                    label = "~r~An execution is happening.";
                     break;
             }
 
@@ -76,7 +76,7 @@ namespace DynamicHostileTerritories.Services
 
             _active = true;
             _endsUtc = DateTime.UtcNow.AddSeconds(75);
-            Game.DisplayNotification(label);
+            Notifier.Show("Street Activity", "~o~" + territory.Name, label);
             Logger.Info("Ambient event (" + kind + ") at " + territory.Name + ".");
             return true;
         }

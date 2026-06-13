@@ -19,8 +19,12 @@ namespace DynamicHostileTerritories.Services
     {
         private const string SetupFolder = @"Plugins\LSPDFR\DynamicHostileTerritories";
         private const string SetupFileName = "territories_setup.json";
-        private const float DefaultRadius = 120f;
+        private const float DefaultRadius = 80f;
         private const float DefaultStrength = 50f;
+
+        // Used to seed a varied initial grip per turf so the city opens with a real mix
+        // of Watchful/Aggressive/Warzone blocks instead of every turf being a max warzone.
+        private static readonly Random _seedRng = new Random();
 
         private readonly List<Territory> _territories;
 
@@ -168,7 +172,7 @@ namespace DynamicHostileTerritories.Services
                 Y = y,
                 Z = z,
                 Radius = DefaultRadius,
-                Strength = DefaultStrength
+                Strength = _seedRng.Next(40, 91)
             };
         }
 
@@ -221,37 +225,37 @@ namespace DynamicHostileTerritories.Services
 
                 Territories = new List<TerritoryDef>
                 {
-                    T("Ballas Turf 1", "Ballas", 101.0282f, -1938.165f, 20.23903f),
-                    T("Ballas Turf 2", "Ballas", -23.34521f, -1826.804f, 25.11959f),
+                    T("Davis", "Ballas", 101.0282f, -1938.165f, 20.23903f),
+                    T("Strawberry", "Ballas", -23.34521f, -1826.804f, 25.11959f),
 
-                    T("Vagos Turf 1", "Vagos", 292.8668f, -2000.102f, 19.80942f),
-                    T("Vagos Turf 2", "Vagos", 490.5248f, -1779.046f, 27.85685f),
-                    T("Vagos Turf 3", "Vagos", 944.0488f, -1854.581f, 30.53767f),
+                    T("Rancho", "Vagos", 292.8668f, -2000.102f, 19.80942f),
+                    T("Cypress Flats", "Vagos", 490.5248f, -1779.046f, 27.85685f),
+                    T("El Burro Heights", "Vagos", 944.0488f, -1854.581f, 30.53767f),
 
-                    T("Marabunta Turf 1", "Marabunta Grande", 1283.708f, -1734.576f, 51.98082f),
-                    T("Marabunta Turf 2", "Marabunta Grande", 1212.528f, -1631.301f, 46.61679f),
-                    T("Marabunta Turf 3", "Marabunta Grande", -1121.539f, -1562.336f, 3.701513f),
+                    T("Murrieta Heights", "Marabunta Grande", 1283.708f, -1734.576f, 51.98082f),
+                    T("Murrieta Oil Field", "Marabunta Grande", 1212.528f, -1631.301f, 46.61679f),
+                    T("Vespucci Canals", "Marabunta Grande", -1121.539f, -1562.336f, 3.701513f),
 
-                    T("Kkangpae Turf 1", "Kkangpae", -754.5678f, -920.0692f, 18.44455f),
+                    T("Little Seoul", "Kkangpae", -754.5678f, -920.0692f, 18.44455f),
 
-                    T("Armenian Turf 1", "Armenian Mob", -605.262f, -1797.159f, 22.90413f),
+                    T("La Puerta", "Armenian Mob", -605.262f, -1797.159f, 22.90413f),
 
-                    T("Madrazo Turf 1", "Madrazo Cartel", 1370.042f, 1146.712f, 113.1948f),
+                    T("Vinewood Hills", "Madrazo Cartel", 1370.042f, 1146.712f, 113.1948f),
 
-                    T("Aztecas Turf 1", "Varrios Los Aztecas", 1889.336f, 3821.397f, 31.74322f),
-                    T("Aztecas Turf 2", "Varrios Los Aztecas", -214.2826f, 6428.561f, 30.86472f),
-                    T("Aztecas Turf 3", "Varrios Los Aztecas", -3228.169f, 1085.752f, 10.16032f),
+                    T("Grapeseed", "Varrios Los Aztecas", 1889.336f, 3821.397f, 31.74322f),
+                    T("Paleto Bay", "Varrios Los Aztecas", -214.2826f, 6428.561f, 30.86472f),
+                    T("Chumash", "Varrios Los Aztecas", -3228.169f, 1085.752f, 10.16032f),
 
-                    T("Families Turf 1", "Families", -14.71192f, -1457.348f, 29.88582f),
-                    T("Families Turf 2", "Families", -179.4559f, -1589.602f, 34.08165f),
+                    T("Chamberlain Hills", "Families", -14.71192f, -1457.348f, 29.88582f),
+                    T("Carson Avenue", "Families", -179.4559f, -1589.602f, 34.08165f),
 
-                    T("Lost MC Turf 1", "The Lost MC", 971.0652f, -126.2237f, 73.77003f),
-                    T("Lost MC Turf 2", "The Lost MC", 72.5417f, 3710.01f, 39.75491f),
-                    T("Lost MC Turf 3", "The Lost MC", -2199.119f, 4295.706f, 47.94391f),
+                    T("Mirror Park", "The Lost MC", 971.0652f, -126.2237f, 73.77003f),
+                    T("Sandy Shores", "The Lost MC", 72.5417f, 3710.01f, 39.75491f),
+                    T("Great Chaparral", "The Lost MC", -2199.119f, 4295.706f, 47.94391f),
 
-                    T("Rednecks Turf 1", "Rednecks", 952.0675f, 3618.137f, 32.55708f),
-                    T("Rednecks Turf 2", "Rednecks", 591.8459f, 2739.823f, 42.07438f),
-                    T("Rednecks Turf 3", "Rednecks", 1669.691f, 4769.295f, 41.84365f)
+                    T("Grapeseed Farms", "Rednecks", 952.0675f, 3618.137f, 32.55708f),
+                    T("Grand Senora Desert", "Rednecks", 591.8459f, 2739.823f, 42.07438f),
+                    T("Mount Chiliad", "Rednecks", 1669.691f, 4769.295f, 41.84365f)
                 }
             };
         }

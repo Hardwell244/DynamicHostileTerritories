@@ -43,6 +43,16 @@ namespace DynamicHostileTerritories.Services
                 List<TerritorySaveData> saved = JsonConvert.DeserializeObject<List<TerritorySaveData>>(json)
                                                 ?? new List<TerritorySaveData>();
 
+                // Map every gang currently in the world by name, so a saved owner (possibly
+                // a gang that conquered this turf last session) can be restored.
+                Dictionary<string, Gang> gangsByName = new Dictionary<string, Gang>();
+                foreach (Territory territory in territories)
+                {
+                    Gang g = territory.ControllingGang;
+                    if (g != null && !gangsByName.ContainsKey(g.Name))
+                        gangsByName[g.Name] = g;
+                }
+
                 foreach (Territory territory in territories)
                 {
                     TerritorySaveData data = saved.FirstOrDefault(d => d.Name == territory.Name);
@@ -51,6 +61,13 @@ namespace DynamicHostileTerritories.Services
 
                     territory.Strength = data.Strength;
                     territory.LastPoliceActionUtc = data.LastPoliceActionUtc;
+
+                    // Restore the conquered owner if we recognise the saved gang.
+                    if (!string.IsNullOrEmpty(data.Gang)
+                        && gangsByName.TryGetValue(data.Gang, out Gang owner))
+                    {
+                        territory.ControllingGang = owner;
+                    }
                 }
 
                 Logger.Info("Territory state restored from save (" + saved.Count + " entries).");
@@ -71,6 +88,7 @@ namespace DynamicHostileTerritories.Services
                     .Select(t => new TerritorySaveData
                     {
                         Name = t.Name,
+                        Gang = t.ControllingGang != null ? t.ControllingGang.Name : null,
                         Strength = t.Strength,
                         LastPoliceActionUtc = t.LastPoliceActionUtc
                     })
@@ -90,6 +108,7 @@ namespace DynamicHostileTerritories.Services
         private sealed class TerritorySaveData
         {
             public string Name { get; set; }
+            public string Gang { get; set; } // controlling gang name, so conquests survive a reload
             public float Strength { get; set; }
             public DateTime LastPoliceActionUtc { get; set; }
         }

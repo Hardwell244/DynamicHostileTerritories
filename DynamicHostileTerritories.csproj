@@ -80,6 +80,7 @@
     <Compile Include="Configuration\PluginSettings.cs" />
     <Compile Include="Core\EntryPoint.cs" />
     <Compile Include="Core\Logger.cs" />
+    <Compile Include="Core\Notifier.cs" />
     <Compile Include="Data\EncounterState.cs" />
     <Compile Include="Data\Gang.cs" />
     <Compile Include="Data\HostilityLevel.cs" />
@@ -87,9 +88,14 @@
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="Services\AmbientEventDirector.cs" />
     <Compile Include="Services\EncounterDirector.cs" />
+    <Compile Include="Services\EnemyBlipManager.cs" />
+    <Compile Include="Services\GangRelationships.cs" />
     <Compile Include="Services\GangSpawnManager.cs" />
     <Compile Include="Services\GangWarfareDirector.cs" />
     <Compile Include="Services\HostilityCalculator.cs" />
+    <Compile Include="Services\SkirmishDirector.cs" />
+    <Compile Include="Services\SquadCommander.cs" />
+    <Compile Include="Services\SquadMember.cs" />
     <Compile Include="Services\TerritoryController.cs" />
     <Compile Include="Services\TerritoryRepository.cs" />
     <Compile Include="Services\TerritoryStateStore.cs" />

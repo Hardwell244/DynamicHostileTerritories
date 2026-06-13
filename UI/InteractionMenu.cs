@@ -193,7 +193,7 @@ namespace DynamicHostileTerritories.UI
 
                 foreach (Territory t in _repository.Territories)
                 {
-                    Blip blip = new Blip(t.Center, _settings.ActivationDistance)
+                    Blip blip = new Blip(t.Center, t.Radius)
                     {
                         Color = t.ControllingGang.BlipColor
                     };
@@ -216,6 +216,9 @@ namespace DynamicHostileTerritories.UI
                 Blip blip = kv.Value;
                 if (!blip.Exists())
                     continue;
+
+                // Recolour to the current owner so a conquest repaints the turf live.
+                blip.Color = t.ControllingGang.BlipColor;
 
                 // Bold when the gang's grip is strong, faint once you've pacified it.
                 blip.Alpha = 0.15f + (t.Strength / 100f) * 0.5f;

@@ -26,7 +26,7 @@ namespace DynamicHostileTerritories.Services
         private readonly HashSet<Ped> _countedNeutralised = new HashSet<Ped>();
 
         // Taking out the area lieutenant breaks the gang's hold far harder than a grunt.
-        private const float BossNeutralizedStrengthDrop = 50f;
+        private const float BossNeutralizedStrengthDrop = 35f;
 
         private GameFiber _loop;
         private bool _running;
@@ -258,7 +258,16 @@ namespace DynamicHostileTerritories.Services
                     _countedNeutralised.Add(ped);
 
                     bool isBoss = bossPed != null && ped == bossPed;
-                    float drop = isBoss ? BossNeutralizedStrengthDrop : _settings.PoliceActionStrengthDrop;
+
+                    // Grip drop is proportional to the garrison size, so it's the NUMBER of
+                    // fighters you clear that breaks a turf — not a fixed amount. A bigger crew
+                    // (higher MaxSpawnedPeds) means each one matters less and the fight lasts
+                    // longer. SpawnedPeds keeps the dead in the list, so its count is the
+                    // garrison's peak size for this activation.
+                    int garrison = Math.Max(1, _spawnManager.SpawnedPeds.Count);
+                    int garrisonGrunts = Math.Max(1, garrison - (bossPed != null ? 1 : 0));
+                    float gruntPool = bossPed != null ? (100f - BossNeutralizedStrengthDrop) : 100f;
+                    float drop = isBoss ? BossNeutralizedStrengthDrop : (gruntPool / garrisonGrunts);
 
                     territory.Strength = Math.Max(0f, territory.Strength - drop);
                     territory.LastPoliceActionUtc = now;
@@ -275,16 +284,14 @@ namespace DynamicHostileTerritories.Services
 
                     if (isBoss)
                     {
-                        Game.DisplayNotification(
-                            "~r~Lieutenant down!~w~ " + territory.ControllingGang.Name
-                            + "'s hold on ~y~" + territory.Name + "~w~ is breaking. Grip: " + (int)territory.Strength + "%.");
+                        Notifier.Show("Lieutenant Down", "~b~" + territory.ControllingGang.Name,
+                            "Their hold on ~y~" + territory.Name + "~w~ is breaking. Grip: " + (int)territory.Strength + "%.");
                         Logger.Info("BOSS neutralised in " + territory.Name + " -> strength " + (int)territory.Strength + "%.");
                     }
                     else
                     {
-                        Game.DisplayNotification(
-                            "~g~Police pressure~w~ in ~y~" + territory.Name
-                            + "~w~. " + territory.ControllingGang.Name + " grip: " + (int)territory.Strength + "%.");
+                        Notifier.Show("Police Pressure", "~o~" + territory.Name,
+                            territory.ControllingGang.Name + " grip down to " + (int)territory.Strength + "%.");
                         Logger.Info("Police action in " + territory.Name + " -> strength " + (int)territory.Strength + "%.");
                     }
                 }
@@ -295,7 +302,7 @@ namespace DynamicHostileTerritories.Services
         {
             if (_activeTerritory == null)
             {
-                Game.DisplayNotification("~y~No active territory to pacify.~w~");
+                Notifier.Show("Field Control", "~o~No active territory", "Step inside a gang turf first.");
                 return;
             }
 
@@ -305,7 +312,7 @@ namespace DynamicHostileTerritories.Services
             _activeTerritory.RecentHeat = 0f;
             _director.ForcePacify();
 
-            Game.DisplayNotification("~g~" + _activeTerritory.Name + " pacified.~w~ The gang has scattered.");
+            Notifier.Show("Area Pacified", "~b~" + _activeTerritory.Name, "The gang has scattered.");
             Logger.Info(_activeTerritory.Name + " force-pacified via menu.");
         }
     }

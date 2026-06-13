@@ -36,6 +36,7 @@ namespace DynamicHostileTerritories.Services
         private DateTime _enteredUtc;
         private DateTime _lastTierCheckUtc;
         private bool _reinforced;
+        private bool _gripBrokenAnnounced;
         private EncounterProfile _profile;
 
         private readonly Random _rng = new Random();
@@ -59,6 +60,7 @@ namespace DynamicHostileTerritories.Services
             _enteredUtc = DateTime.UtcNow;
             _lastTierCheckUtc = _enteredUtc;
             _reinforced = false;
+            _gripBrokenAnnounced = false;
             _eventTriggered = false;
             _nextEventCheckUtc = _enteredUtc.AddSeconds(20);
 
@@ -80,12 +82,40 @@ namespace DynamicHostileTerritories.Services
 
         public void Update(Territory territory, Ped player)
         {
-            if (_territory == null || _tier == HostilityLevel.Pacified)
+            if (_territory == null)
                 return;
 
+            // Maintenance ALWAYS runs while a turf is active. This is what stops dead
+            // enemies keeping their blips and the director freezing when the grip breaks
+            // mid-fight (tier hitting Pacified used to early-return and stall everything).
             _spawnManager.UpdateSkirmish();
             _spawnManager.PruneDeadBlips();
             _events.Update();
+
+            // The crew breaks when only a fraction of the garrison is left standing — NOT
+            // at a fixed strength. The survivors then each react on their own (some hands
+            // up, some flee, some fight to the death) via BreakResolve.
+            int garrison = Math.Max(1, _spawnManager.SpawnedPeds.Count);
+            int breakAt = Math.Max(2, garrison / 4);
+            int living = _spawnManager.LivingFighters;
+            bool engaged = (int)_state >= (int)EncounterState.Provoked
+                           || territory.Strength < _settings.PacifiedBelow;
+
+            if (engaged && living > 0 && living <= breakAt)
+            {
+                if (!_gripBrokenAnnounced && _spawnManager.BreakResolve())
+                {
+                    _gripBrokenAnnounced = true;
+                    Logger.Info("Grip broken at " + territory.Name + " — crew scattered.");
+                    Notifier.Show("Grip Broken", "~b~" + territory.ControllingGang.Name,
+                        "Their hold on ~y~" + territory.Name + "~w~ is breaking — some run, some fight, some give up.");
+                }
+                return;
+            }
+
+            // Entered an already-pacified, empty turf: nothing to run.
+            if (_tier == HostilityLevel.Pacified)
+                return;
 
             MaybeTriggerAmbientEvent(territory);
 
@@ -108,19 +138,6 @@ namespace DynamicHostileTerritories.Services
                 _spawnManager.ApplyPosture(_state, _tier);
                 Logger.Info("Escalation at " + territory.Name + " -> " + _state + ".");
                 NotifyEscalation(territory, _state);
-            }
-
-            // When a turf's war is all but lost, the last men standing give up so the
-            // player can cuff them instead of having to kill every last one.
-            if (_state == EncounterState.War)
-            {
-                int left = _spawnManager.LivingFighters;
-                if (left > 0 && left <= 2 && _spawnManager.Surrender())
-                {
-                    Logger.Info("Surrender at " + territory.Name + " (" + left + " left).");
-                    Game.DisplayNotification("~o~" + territory.ControllingGang.Name
-                        + "~w~ are giving up — cuff them.");
-                }
             }
 
         }
@@ -186,13 +203,23 @@ namespace DynamicHostileTerritories.Services
             if (newTier == _tier)
                 return;
 
+            // FIX: Se o jogador já chamou a atenção (Suspicious, Provoked ou War),
+            // NÃO damos respawn na gangue para não fazer os inimigos sumirem no meio do tiro.
+            if (_state != EncounterState.Observing)
+            {
+                // Apenas atualizamos as variáveis para o jogo registrar que enfraqueceu
+                _tier = newTier;
+                territory.Hostility = newTier;
+                return;
+            }
+
             Logger.Info("Tier change at " + territory.Name + ": " + _tier + " -> " + newTier + " (respawning).");
 
             _tier = newTier;
             territory.Hostility = newTier;
 
             _spawnManager.Activate(territory, newTier);
-            _spawnManager.ApplyPosture(_state, _tier); // keep current alert level after respawn
+            _spawnManager.ApplyPosture(_state, _tier);
         }
 
         private EncounterState EvaluateState(Territory territory, Ped player)
@@ -266,7 +293,7 @@ namespace DynamicHostileTerritories.Services
         {
             switch (tier)
             {
-                case HostilityLevel.Warzone: return 110f;
+                case HostilityLevel.Warzone: return 80f;
                 case HostilityLevel.Aggressive: return 70f;
                 default: return 35f;
             }
@@ -282,14 +309,13 @@ namespace DynamicHostileTerritories.Services
             string mood;
             switch (profile)
             {
-                case EncounterProfile.Hostile: mood = "~r~Something feels wrong here."; break;
-                case EncounterProfile.Tense: mood = "~o~Armed crew, eyes on you."; break;
-                default: mood = "~y~Quiet for now — stay sharp."; break;
+                case EncounterProfile.Hostile: mood = "Something feels wrong here."; break;
+                case EncounterProfile.Tense: mood = "Armed crew, eyes on you."; break;
+                default: mood = "Quiet for now — stay sharp."; break;
             }
 
-            Game.DisplayNotification(
-                "~y~" + territory.ControllingGang.Name + "~w~ territory: ~o~" + territory.Name
-                + "~w~ [" + tier + "].~n~" + mood);
+            Notifier.Show("Entering " + territory.ControllingGang.Name + " Turf",
+                "~o~" + territory.Name + " ~w~[" + tier + "]", mood);
         }
 
         private static void NotifyEscalation(Territory territory, EncounterState state)
@@ -298,10 +324,10 @@ namespace DynamicHostileTerritories.Services
             switch (state)
             {
                 case EncounterState.Suspicious:
-                    line = "~o~" + territory.ControllingGang.Name + "~w~ are on alert.";
+                    line = territory.ControllingGang.Name + " are on alert.";
                     break;
                 case EncounterState.Provoked:
-                    line = "~o~" + territory.ControllingGang.Name + "~w~ have you in their sights.";
+                    line = territory.ControllingGang.Name + " have you in their sights.";
                     break;
                 case EncounterState.War:
                     line = "~r~" + territory.ControllingGang.Name + " opened fire!";
@@ -310,7 +336,7 @@ namespace DynamicHostileTerritories.Services
                     return;
             }
 
-            Game.DisplayNotification(line);
+            Notifier.Show("Territory Alert", "~o~" + territory.Name, line);
         }
     }
 }

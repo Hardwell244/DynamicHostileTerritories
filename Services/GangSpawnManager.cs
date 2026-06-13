@@ -1,6 +1,5 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Drawing;
 using DynamicHostileTerritories.Core;
 using DynamicHostileTerritories.Data;
 using Rage;
@@ -19,28 +18,6 @@ namespace DynamicHostileTerritories.Services
     /// </summary>
     public sealed class GangSpawnManager
     {
-        private enum Role { Sentry, Loiter, Patrol, Guard }
-
-        private sealed class Member
-        {
-            public Ped Ped;
-            public Vector3 Home;
-            public Role Role;
-            public string Weapon;
-            public Blip Blip; // red enemy blip on the map/radar while the turf is active
-            public bool IsBoss; // area lieutenant — killing/arresting them breaks the grip
-        }
-
-        private static readonly string[] LoiterScenarios =
-        {
-            "WORLD_HUMAN_SMOKING",
-            "WORLD_HUMAN_STAND_MOBILE",
-            "WORLD_HUMAN_HANG_OUT_STREET",
-            "WORLD_HUMAN_DRINKING",
-            "WORLD_HUMAN_LEANING",
-            "WORLD_HUMAN_AA_SMOKE"
-        };
-
         private static readonly string[] WatchfulWeapons =
         {
             "weapon_pistol", "weapon_pistol", "weapon_combatpistol", "weapon_microsmg"
@@ -56,27 +33,20 @@ namespace DynamicHostileTerritories.Services
             "weapon_carbinerifle", "weapon_assaultrifle", "weapon_specialcarbine", "weapon_smg", "weapon_pumpshotgun"
         };
 
-        // Generic rival crew that invades a turf during a gang-vs-gang skirmish.
-        private static readonly string[] RivalModels =
-        {
-            "g_m_y_strpunk_01", "g_m_y_strpunk_02", "g_m_y_armgoon_02", "g_m_y_mexgoon_02"
-        };
+        // Gang-vs-gang skirmish, fully owned by its own director (separate peds/groups).
+        private readonly SkirmishDirector _skirmish = new SkirmishDirector();
 
-        // Self-contained gang-vs-gang skirmish (separate peds/groups; ignores the player
-        // encounter state machine entirely).
-        private RelationshipGroup _skDefGroup;
-        private RelationshipGroup _skAtkGroup;
-        private readonly List<Ped> _skirmishPeds = new List<Ped>();
-        private bool _skirmishActive;
-        private DateTime _skirmishEndsUtc;
+        // Enemy map blips, fully owned by their own manager (created only when hostile).
+        private readonly EnemyBlipManager _blipManager = new EnemyBlipManager();
+
+        // Relationship-group plumbing (cache, gang setup, hostility), owned externally.
+        private readonly GangRelationships _relationships = new GangRelationships();
+
+        // AI / posture tasking, owned externally.
+        private readonly SquadCommander _commander = new SquadCommander();
 
         private readonly int _maxPeds;
         private readonly Random _rng = new Random();
-
-        // Reuse relationship groups by name instead of creating a new one on every
-        // activation/skirmish — otherwise they pile up over a long session (leak).
-        private static readonly Dictionary<string, RelationshipGroup> _groupCache =
-            new Dictionary<string, RelationshipGroup>();
 
         private readonly List<Member> _members = new List<Member>();
         private readonly List<Ped> _peds = new List<Ped>(); // mirror, kept in sync for cleanup + police detection
@@ -130,9 +100,7 @@ namespace DynamicHostileTerritories.Services
                 return;
             }
 
-            _gangGroup = Group("DHT_" + territory.ControllingGang.Name);
-            _gangGroup.SetRelationshipWith(_gangGroup, Relationship.Companion); // same crew — never shoot each other
-            AllyWithAmbientGang(territory.ControllingGang.Name);                 // don't fight the game's own gang of the same kind
+            _gangGroup = _relationships.SetupGang(territory.ControllingGang.Name);
             _hasGangGroup = true;
 
             int desired = Math.Min(PedCountFor(tier), _maxPeds);
@@ -237,12 +205,7 @@ namespace DynamicHostileTerritories.Services
 
             _surrendered = true;
 
-            RelationshipGroup player = Game.LocalPlayer.Character.RelationshipGroup;
-            RelationshipGroup cops = RelationshipGroup.Cop;
-            _gangGroup.SetRelationshipWith(player, Relationship.Neutral);
-            _gangGroup.SetRelationshipWith(cops, Relationship.Neutral);
-            player.SetRelationshipWith(_gangGroup, Relationship.Neutral);
-            cops.SetRelationshipWith(_gangGroup, Relationship.Neutral);
+            _relationships.SetNeutral(_gangGroup);
 
             int count = 0;
             foreach (Member m in _members)
@@ -260,6 +223,74 @@ namespace DynamicHostileTerritories.Services
             return true;
         }
 
+        /// <summary>
+        /// The crew's hold is broken with fighters still standing. Instead of everyone
+        /// throwing their hands up, each survivor reacts on its own: ~40% surrender (hands
+        /// up), ~30% flee, ~30% fight to the death. Surrendering/fleeing peds are moved to
+        /// a neutral group so they stop being hostile, while the diehards stay in the gang
+        /// group and keep fighting. Idempotent — returns true only on the first call.
+        /// </summary>
+        public bool BreakResolve()
+        {
+            if (!_hasGangGroup || _surrendered)
+                return false;
+
+            _surrendered = true; // stop ApplyPosture from re-tasking the whole squad
+
+            Ped player = Game.LocalPlayer.Character;
+            bool playerOk = player != null && player.Exists();
+            RelationshipGroup neutral = _relationships.StoodDownGroup();
+
+            int gaveUp = 0, fled = 0, fighting = 0;
+            foreach (Member m in _members)
+            {
+                if (!m.Ped.Exists() || m.Ped.IsDead)
+                    continue;
+
+                double roll = _rng.NextDouble();
+
+                if (roll < 0.40)
+                {
+                    // Surrender: hands up, no longer hostile, ready to be cuffed.
+                    m.Ped.Tasks.Clear();
+                    m.Ped.BlockPermanentEvents = true;
+                    m.Ped.RelationshipGroup = neutral;
+                    NativeFunction.Natives.TASK_HANDS_UP(m.Ped, -1, 0, -1, 0);
+                    gaveUp++;
+                }
+                else if (roll < 0.70)
+                {
+                    // Flee: bolt away from the player, no longer hostile.
+                    m.Ped.Tasks.Clear();
+                    m.Ped.BlockPermanentEvents = false;
+                    m.Ped.RelationshipGroup = neutral;
+
+                    Vector3 away = m.Ped.Position;
+                    if (playerOk)
+                    {
+                        Vector3 dir = m.Ped.Position - player.Position;
+                        float len = dir.Length();
+                        if (len > 0.1f)
+                            away = m.Ped.Position + (dir / len) * 60f;
+                    }
+                    m.Ped.Tasks.FollowNavigationMeshToPosition(away, 0f, 3.0f);
+                    fled++;
+                }
+                else
+                {
+                    // Fight to the death: stays in the gang (hostile) group.
+                    m.Ped.Tasks.Clear();
+                    m.Ped.BlockPermanentEvents = false;
+                    if (playerOk)
+                        NativeFunction.Natives.TASK_COMBAT_PED(m.Ped, player, 0, 16);
+                    fighting++;
+                }
+            }
+
+            Logger.Info("Crew broke: " + gaveUp + " surrendered, " + fled + " fled, " + fighting + " fighting on.");
+            return true;
+        }
+
         // --- Gang-vs-gang skirmish (self-contained ambient event) -------------------------
 
         /// <summary>
@@ -270,146 +301,28 @@ namespace DynamicHostileTerritories.Services
         /// </summary>
         public bool TriggerSkirmish(Territory territory)
         {
-            if (!_isActive || _skirmishActive || _surrendered)
+            // Guarded by the squad's own state; the skirmish itself is self-contained.
+            if (!_isActive || _surrendered)
                 return false;
 
-            _skDefGroup = Group("DHT_Skirmish_Def");
-            _skAtkGroup = Group("DHT_Skirmish_Atk");
-            _skDefGroup.SetRelationshipWith(_skDefGroup, Relationship.Companion);
-            _skAtkGroup.SetRelationshipWith(_skAtkGroup, Relationship.Companion);
-            _skDefGroup.SetRelationshipWith(_skAtkGroup, Relationship.Hate);
-            _skAtkGroup.SetRelationshipWith(_skDefGroup, Relationship.Hate);
-
-            Vector3 defPos = RingPoint(territory.Center, territory.Radius, 0, 1, 0.55f);
-            Vector3 atkPos = RingPoint(territory.Center, territory.Radius, 0, 1, 0.85f);
-
-            List<Ped> defenders = SpawnSkirmishSide(territory.ControllingGang.PedModels, _skDefGroup, defPos, 3);
-            List<Ped> attackers = SpawnSkirmishSide(RivalModels, _skAtkGroup, atkPos, 3);
-
-            if (defenders.Count == 0 || attackers.Count == 0)
-            {
-                EndSkirmish();
-                return false;
-            }
-
-            foreach (Ped d in defenders)
-            {
-                Ped t = attackers[_rng.Next(attackers.Count)];
-                if (d.Exists() && t.Exists())
-                    NativeFunction.Natives.TASK_COMBAT_PED(d, t, 0, 16);
-            }
-            foreach (Ped a in attackers)
-            {
-                Ped t = defenders[_rng.Next(defenders.Count)];
-                if (a.Exists() && t.Exists())
-                    NativeFunction.Natives.TASK_COMBAT_PED(a, t, 0, 16);
-            }
-
-            _skirmishActive = true;
-            _skirmishEndsUtc = DateTime.UtcNow.AddSeconds(90);
-            Logger.Info("Turf skirmish at " + territory.Name + " (" + defenders.Count + " vs " + attackers.Count + ").");
-            Game.DisplayNotification("~r~Gang clash~w~ in ~o~" + territory.Name + "~w~ — a rival crew is moving in.");
-            return true;
+            return _skirmish.TryStart(territory);
         }
 
         /// <summary>Cleans the skirmish up once it times out or one side is wiped.</summary>
         public void UpdateSkirmish()
         {
-            if (!_skirmishActive)
-                return;
-
-            int alive = 0;
-            foreach (Ped p in _skirmishPeds)
-                if (p.Exists() && !p.IsDead) alive++;
-
-            if (DateTime.UtcNow >= _skirmishEndsUtc || alive <= 1)
-                EndSkirmish();
-        }
-
-        /// <summary>Returns a relationship group by name, creating it once and reusing it.</summary>
-        private static RelationshipGroup Group(string name)
-        {
-            if (!_groupCache.TryGetValue(name, out RelationshipGroup group))
-            {
-                group = new RelationshipGroup(name);
-                _groupCache[name] = group;
-            }
-            return group;
+            _skirmish.Update();
         }
 
         /// <summary>
-        /// Makes our spawned crew friendly with the game's own ambient gang of the same
-        /// kind, so the vanilla gang peds (and ours) stop shooting each other. Names that
-        /// don't exist simply create an empty group and have no effect — safe either way.
+        /// Shows or hides the red grunt blips. They only appear once the crew is hostile
+        /// (Provoked/War) so a quiet or watchful turf stays clean on the map. The boss
+        /// blip is created on demand the same way (gold) by the blip manager.
         /// </summary>
-        private void AllyWithAmbientGang(string gangName)
+        private void SetGruntBlipsVisible(bool show)
         {
-            string ambient;
-            switch (gangName)
-            {
-                case "Families": ambient = "AMBIENT_GANG_FAMILY"; break;
-                case "Ballas": ambient = "AMBIENT_GANG_BALLAS"; break;
-                case "Vagos": ambient = "AMBIENT_GANG_MEXICAN"; break;
-                case "Varrios Los Aztecas": ambient = "AMBIENT_GANG_MEXICAN"; break;
-                case "Madrazo Cartel": ambient = "AMBIENT_GANG_MEXICAN"; break;
-                case "Marabunta Grande": ambient = "AMBIENT_GANG_MARABUNTE"; break;
-                case "Kkangpae": ambient = "AMBIENT_GANG_KOREAN"; break;
-                case "The Lost MC": ambient = "AMBIENT_GANG_LOST"; break;
-                case "Rednecks": ambient = "AMBIENT_GANG_HILLBILLY"; break;
-                default: return; // Armenian Mob etc. have no clean vanilla group — skip.
-            }
-
-            RelationshipGroup ambientGroup = Group(ambient);
-            _gangGroup.SetRelationshipWith(ambientGroup, Relationship.Companion);
-            ambientGroup.SetRelationshipWith(_gangGroup, Relationship.Companion);
-        }
-
-        private List<Ped> SpawnSkirmishSide(IReadOnlyList<string> models, RelationshipGroup group, Vector3 around, int count)
-        {
-            List<Ped> list = new List<Ped>();
-
-            for (int i = 0; i < count; i++)
-            {
-                Vector3 p = RandomPointAround(around, 5f);
-                if (NativeFunction.Natives.GET_SAFE_COORD_FOR_PED<bool>(p.X, p.Y, p.Z, true, out Vector3 safe, 0))
-                    p = safe;
-
-                string model = models[_rng.Next(models.Count)];
-
-                Ped ped;
-                try
-                {
-                    ped = new Ped(model, p, _rng.Next(0, 360));
-                }
-                catch (Exception ex)
-                {
-                    Logger.Warn("Skirmish ped '" + model + "' failed: " + ex.Message);
-                    continue;
-                }
-
-                if (!ped.Exists())
-                    continue;
-
-                ped.IsPersistent = true;
-                ped.BlockPermanentEvents = false;
-                ped.RelationshipGroup = group;
-                ped.Accuracy = 25;
-                ped.Inventory.GiveNewWeapon("weapon_microsmg", -1, true);
-
-                _skirmishPeds.Add(ped);
-                list.Add(ped);
-                GameFiber.Sleep(60);
-            }
-
-            return list;
-        }
-
-        private void EndSkirmish()
-        {
-            foreach (Ped p in _skirmishPeds)
-                if (p.Exists()) p.Delete();
-            _skirmishPeds.Clear();
-            _skirmishActive = false;
+            string gangName = _territory != null ? _territory.ControllingGang.Name : null;
+            _blipManager.SetVisible(_peds, BossPed, gangName, show);
         }
 
         /// <summary>
@@ -419,28 +332,18 @@ namespace DynamicHostileTerritories.Services
         /// </summary>
         public void PruneDeadBlips()
         {
-            foreach (Member m in _members)
-            {
-                if (m.Blip == null)
-                    continue;
-
-                bool gone = !m.Ped.Exists() || m.Ped.IsDead;
-                if (gone)
-                {
-                    if (m.Blip.Exists()) m.Blip.Delete();
-                    m.Blip = null;
-                }
-            }
+            _blipManager.Prune();
         }
 
         public void Deactivate()
         {
             int peds = _peds.Count;
-            EndSkirmish();
+            _skirmish.End();
+
+            _blipManager.Clear();
 
             foreach (Member m in _members)
             {
-                if (m.Blip != null && m.Blip.Exists()) m.Blip.Delete();
                 if (m.Ped.Exists()) m.Ped.Delete();
             }
             _members.Clear();
@@ -476,103 +379,11 @@ namespace DynamicHostileTerritories.Services
 
             ApplyRelationship(state);
 
-            Ped player = Game.LocalPlayer.Character;
+            // Red grunt blips only while the crew is actually hostile.
+            SetGruntBlipsVisible((int)state >= (int)EncounterState.Provoked);
 
-            if (player == null || !player.Exists() || !player.IsAlive) return;
-
-            // For the Provoked ambush: mobile members (patrol/loiter) peel off to encircle
-            // the player from different bearings while the posted ones hold the core.
-            int flankTotal = 0;
-            if (state == EncounterState.Provoked)
-                foreach (Member fm in _members)
-                    if (fm.Role == Role.Patrol || fm.Role == Role.Loiter) flankTotal++;
-            int flankIndex = 0;
-
-            foreach (Member m in _members)
-            {
-                if (!m.Ped.Exists())
-                    continue;
-
-                switch (state)
-                {
-                    case EncounterState.Observing:
-                        StagePresence(m);
-                        break;
-
-                    case EncounterState.Suspicious:
-                        // Noticed you: stop, draw, face you and hold the spot. No chasing.
-                        m.Ped.Tasks.Clear();
-                        m.Ped.BlockPermanentEvents = false;
-                        EquipWeapon(m);
-                        NativeFunction.Natives.TASK_TURN_PED_TO_FACE_ENTITY(m.Ped, player, 4000);
-                        NativeFunction.Natives.TASK_GUARD_CURRENT_POSITION(m.Ped, 8f, 8f, true);
-                        break;
-
-                    case EncounterState.Provoked:
-                        // AMBUSH: mobile members move to surround the player from several
-                        // bearings; posted members (sentry/roadblock) hold the core. When
-                        // war breaks out everyone is already closing the pincer.
-                        m.Ped.Tasks.Clear();
-                        m.Ped.BlockPermanentEvents = false;
-                        EquipWeapon(m);
-                        if (m.Role == Role.Patrol || m.Role == Role.Loiter)
-                        {
-                            Vector3 flank = EncirclePoint(player.Position, 18f, flankIndex, flankTotal);
-                            flankIndex++;
-                            m.Ped.Tasks.FollowNavigationMeshToPosition(flank, 0f, 2.5f);
-                        }
-                        else
-                        {
-                            NativeFunction.Natives.TASK_GUARD_CURRENT_POSITION(m.Ped, 20f, 20f, true);
-                        }
-                        break;
-
-                    case EncounterState.War:
-                        // Open combat: the AI advances, flanks and uses cover on its own.
-                        m.Ped.Tasks.Clear();
-                        m.Ped.BlockPermanentEvents = false;
-                        NativeFunction.Natives.TASK_COMBAT_PED(m.Ped, player, 0, 16);
-                        break;
-                }
-            }
-
-            Logger.Debug("Applied posture " + state + " to " + _members.Count + " members.");
-        }
-
-        // --- Living ambient presence (Observing) ------------------------------------------
-
-        private void StagePresence(Member m)
-        {
-            m.Ped.BlockPermanentEvents = true;
-            bool armedPresence = _tier >= HostilityLevel.Aggressive;
-
-            switch (m.Role)
-            {
-                case Role.Sentry:
-                case Role.Guard:
-                    if (armedPresence)
-                    {
-                        // Armed lookout: stands holding the weapon, watching the block.
-                        EquipWeapon(m);
-                        NativeFunction.Natives.TASK_GUARD_CURRENT_POSITION(m.Ped, 5f, 5f, true);
-                    }
-                    else
-                    {
-                        NativeFunction.Natives.TASK_START_SCENARIO_IN_PLACE(m.Ped, "WORLD_HUMAN_GUARD_STAND", 0, true);
-                    }
-                    break;
-
-                case Role.Loiter:
-                    string scenario = LoiterScenarios[_rng.Next(LoiterScenarios.Length)];
-                    NativeFunction.Natives.TASK_START_SCENARIO_IN_PLACE(m.Ped, scenario, 0, true);
-                    break;
-
-                case Role.Patrol:
-                    // Walks the block. Weapon holstered while patrolling; drawn when alerted.
-                    Vector3 c = _territory.Center;
-                    NativeFunction.Natives.TASK_WANDER_IN_AREA(m.Ped, c.X, c.Y, c.Z, _territory.Radius * 0.7f, 4f, 7f);
-                    break;
-            }
+            // AI tasking is delegated to the commander.
+            _commander.Command(_members, _territory, state, tier);
         }
 
         // --- Spawning ---------------------------------------------------------------------
@@ -581,9 +392,7 @@ namespace DynamicHostileTerritories.Services
         {
             string model = Pick(_territory.ControllingGang.PedModels);
 
-            Vector3 spawnPos = around;
-            if (NativeFunction.Natives.GET_SAFE_COORD_FOR_PED<bool>(around.X, around.Y, around.Z, true, out Vector3 safe, 0))
-                spawnPos = safe;
+            Vector3 spawnPos = ResolveSpawnPoint(around);
 
             float heading = _rng.Next(0, 360);
 
@@ -612,36 +421,23 @@ namespace DynamicHostileTerritories.Services
             ApplyStats(ped, tier);
             ped.Inventory.GiveNewWeapon(weapon, -1, false); // holstered until staged/alerted
 
-            Blip blip = null;
-            try
-            {
-                blip = new Blip(ped)
-                {
-                    Color = Color.Red,
-                    Scale = 0.7f,
-                    Name = "Gang member"
-                };
-                NativeFunction.Natives.SET_BLIP_AS_SHORT_RANGE(blip, true); // only shows when near, keeps the map clean
-            }
-            catch { /* a blip failure must never stop a spawn */ }
-
-            _members.Add(new Member { Ped = ped, Home = spawnPos, Role = role, Weapon = weapon, Blip = blip });
-            _peds.Add(ped);
+            // Grunt blips are created on demand only when the crew turns hostile
+            // (see SetGruntBlipsVisible), so a quiet/watchful turf shows no red dots.
+            _members.Add(new Member { Ped = ped, Home = spawnPos, Role = role, Weapon = weapon });
+            _peds.Add(ped); // MUST be tracked here, or police actions on grunts never count
             return true;
         }
 
         /// <summary>
         /// Spawns the area lieutenant: a tougher, well-armed boss using the gang's boss/
-        /// lieutenant model when it has one, with a gold blip that stays on the map. The
-        /// controller treats this ped specially — neutralising them craters the grip.
+        /// lieutenant model when it has one. Its gold blip is created on demand by the blip
+        /// manager. The controller treats this ped specially — neutralising them craters the grip.
         /// </summary>
         private bool SpawnBoss(Vector3 around, HostilityLevel tier)
         {
             string model = PickBossModel(_territory.ControllingGang.PedModels);
 
-            Vector3 spawnPos = around;
-            if (NativeFunction.Natives.GET_SAFE_COORD_FOR_PED<bool>(around.X, around.Y, around.Z, true, out Vector3 safe, 0))
-                spawnPos = safe;
+            Vector3 spawnPos = ResolveSpawnPoint(around);
 
             Ped ped;
             try
@@ -665,25 +461,11 @@ namespace DynamicHostileTerritories.Services
             ped.IsPersistent = true;
             ped.BlockPermanentEvents = true;
             ped.RelationshipGroup = _gangGroup;
-            ped.Accuracy = 80;
+            ped.Accuracy = 65;
             ped.Armor = 100;
             ped.MaxHealth = 400;
             ped.Health = 400;
             ped.Inventory.GiveNewWeapon(bossWeapon, -1, false);
-
-            Blip blip = null;
-            try
-            {
-                blip = new Blip(ped)
-                {
-                    Color = Color.Gold,
-                    Scale = 1.0f,
-                    Name = _territory.ControllingGang.Name + " Lieutenant"
-                };
-                // Boss stays visible on the map at any distance (not short-range) so the
-                // player can hunt the priority target.
-            }
-            catch { /* a blip failure must never stop a spawn */ }
 
             Member boss = new Member
             {
@@ -691,7 +473,6 @@ namespace DynamicHostileTerritories.Services
                 Home = spawnPos,
                 Role = Role.Sentry,
                 Weapon = bossWeapon,
-                Blip = blip,
                 IsBoss = true
             };
 
@@ -757,48 +538,23 @@ namespace DynamicHostileTerritories.Services
             switch (tier)
             {
                 case HostilityLevel.Watchful:
-                    ped.Accuracy = 20;
+                    ped.Accuracy = 15;
                     ped.Armor = 0;
                     break;
                 case HostilityLevel.Aggressive:
-                    ped.Accuracy = 40;
+                    ped.Accuracy = 30;
                     ped.Armor = 25;
                     break;
                 case HostilityLevel.Warzone:
-                    ped.Accuracy = 60;
+                    ped.Accuracy = 40;
                     ped.Armor = 75;
                     break;
             }
         }
 
-        private void EquipWeapon(Member m)
-        {
-            if (string.IsNullOrEmpty(m.Weapon) || m.Weapon == "weapon_unarmed")
-                return;
-
-            NativeFunction.Natives.SET_CURRENT_PED_WEAPON(m.Ped, Game.GetHashKey(m.Weapon), true);
-        }
-
         private void ApplyRelationship(EncounterState state)
         {
-            RelationshipGroup player = Game.LocalPlayer.Character.RelationshipGroup;
-            RelationshipGroup cops = RelationshipGroup.Cop;
-
-            Relationship rel;
-            switch (state)
-            {
-                case EncounterState.War: rel = Relationship.Hate; break;
-                case EncounterState.Provoked: rel = Relationship.Dislike; break;
-                default: rel = Relationship.Neutral; break;
-            }
-
-            _gangGroup.SetRelationshipWith(player, rel);
-            _gangGroup.SetRelationshipWith(cops, rel);
-            // Set the reverse direction too, so leaving war / leaving the turf actually
-            // clears the hostility on the cached group instead of leaving cops/player
-            // permanently hating this gang.
-            player.SetRelationshipWith(_gangGroup, rel);
-            cops.SetRelationshipWith(_gangGroup, rel);
+            _relationships.SetHostility(_gangGroup, state);
         }
 
         // --- Helpers ----------------------------------------------------------------------
@@ -832,22 +588,6 @@ namespace DynamicHostileTerritories.Services
             return options[_rng.Next(options.Count)];
         }
 
-        /// <summary>
-        /// A snapped point on a ring around the player, used to surround them during an
-        /// ambush. Bearings are spread so closers come in from different sides.
-        /// </summary>
-        private Vector3 EncirclePoint(Vector3 playerPos, float radius, int index, int count)
-        {
-            double angle = (index / (double)Math.Max(1, count)) * Math.PI * 2.0;
-            float x = playerPos.X + (float)Math.Cos(angle) * radius;
-            float y = playerPos.Y + (float)Math.Sin(angle) * radius;
-
-            Vector3 point = new Vector3(x, y, playerPos.Z);
-            if (NativeFunction.Natives.GET_SAFE_COORD_FOR_PED<bool>(point.X, point.Y, point.Z, true, out Vector3 safe, 0))
-                point = safe;
-            return point;
-        }
-
         private Vector3 RingPoint(Vector3 center, float radius, int index, int count, float spreadFactor = 0.6f)
         {
             // Spread members around the core so the turf feels occupied as you push in.
@@ -868,6 +608,30 @@ namespace DynamicHostileTerritories.Services
             float x = center.X + (float)Math.Cos(angle) * distance;
             float y = center.Y + (float)Math.Sin(angle) * distance;
             return new Vector3(x, y, center.Z);
+        }
+
+        /// <summary>
+        /// Resolves a usable spawn point near 'around'. GET_SAFE_COORD_FOR_PED sometimes
+        /// returns a point inside an inaccessible structure (common in dense built-up
+        /// blocks), so we try a few candidates and, if none resolve cleanly, drop the ped
+        /// on the nearest street instead of trapping it inside a building.
+        /// </summary>
+        private Vector3 ResolveSpawnPoint(Vector3 around)
+        {
+            for (int attempt = 0; attempt < 5; attempt++)
+            {
+                Vector3 candidate = attempt == 0
+                    ? around
+                    : RandomPointAround(around, _territory.Radius * 0.5f);
+
+                if (NativeFunction.Natives.GET_SAFE_COORD_FOR_PED<bool>(
+                        candidate.X, candidate.Y, candidate.Z, true, out Vector3 safe, 0))
+                    return safe;
+            }
+
+            // Dense building cluster — nothing safe nearby. A street edge is always
+            // reachable, which is far better than spawning sealed inside a structure.
+            return World.GetNextPositionOnStreet(around);
         }
     }
 }
