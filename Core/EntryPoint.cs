@@ -25,6 +25,7 @@ namespace DynamicHostileTerritories.Core
         private EncounterDirector _director;
         private TerritoryController _controller;
         private GangWarfareDirector _warfare;
+        private RetaliationDirector _retaliation;
         private InteractionMenu _menu;
 
         private GameFiber _inputFiber;
@@ -54,6 +55,9 @@ namespace DynamicHostileTerritories.Core
                 _director = new EncounterDirector(_settings, _hostility, _spawnManager);
                 _controller = new TerritoryController(_settings, _repository, _director, _spawnManager, _stateStore);
                 _warfare = new GangWarfareDirector(_repository, _controller);
+                _retaliation = new RetaliationDirector(_repository);
+                _controller.Retaliation = _retaliation;
+                _controller.Warfare = _warfare; // player pressure bleeds the gang's war chest
                 _menu = new InteractionMenu(_settings, _controller, _repository, _warfare);
 
                 Functions.OnOnDutyStateChanged += OnOnDutyStateChanged;
@@ -88,6 +92,7 @@ namespace DynamicHostileTerritories.Core
             _onDuty = true;
             _controller.Start();
             _warfare?.Start();
+            _retaliation?.Start();
 
             int gen = ++_inputGen;
             _inputFiber = GameFiber.StartNew(() => InputLoop(gen));
@@ -103,6 +108,7 @@ namespace DynamicHostileTerritories.Core
             _inputFiber = null; // no Abort — the loop sees the flag/generation and exits
 
             _menu?.Dispose();
+            _retaliation?.Stop();
             _warfare?.Stop();
             _controller?.Stop();
         }

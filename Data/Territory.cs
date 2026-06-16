@@ -6,7 +6,7 @@ namespace DynamicHostileTerritories.Data
     /// <summary>
     /// A hostile territory: a circular area controlled by a gang. Holds both its
     /// static definition (set once) and its runtime state (mutated by services).
-    /// Pure data — no behaviour lives here.
+    /// Pure data - no behaviour lives here.
     /// </summary>
     public sealed class Territory
     {
@@ -15,6 +15,11 @@ namespace DynamicHostileTerritories.Data
         public Gang ControllingGang { get; set; }
         public Vector3 Center { get; }
         public float Radius { get; }
+
+        // A gang's home turf / redoubt: the meta-simulation never conquers a stronghold, so a
+        // gang can't be wiped off the map through its base and the player has to take it
+        // personally. Set once from the setup file (or auto-assigned, one per gang).
+        public bool IsStronghold { get; set; }
 
         // --- Persisted runtime state (saved to / loaded from JSON). ---
 

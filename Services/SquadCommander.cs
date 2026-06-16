@@ -139,7 +139,9 @@ namespace DynamicHostileTerritories.Services
 
         /// <summary>
         /// A snapped point on a ring around the player, used to surround them during an
-        /// ambush. Bearings are spread so closers come in from different sides.
+        /// ambush. Bearings are spread so closers come in from different sides. Resolved
+        /// through the shared SpawnPlacement helper (grounded, navmesh-safe); if nothing
+        /// resolves we fall back to the raw ring point.
         /// </summary>
         private Vector3 EncirclePoint(Vector3 playerPos, float radius, int index, int count)
         {
@@ -148,8 +150,8 @@ namespace DynamicHostileTerritories.Services
             float y = playerPos.Y + (float)Math.Sin(angle) * radius;
 
             Vector3 point = new Vector3(x, y, playerPos.Z);
-            if (NativeFunction.Natives.GET_SAFE_COORD_FOR_PED<bool>(point.X, point.Y, point.Z, true, out Vector3 safe, 0))
-                point = safe;
+            if (SpawnPlacement.TryResolve(point, 4f, 0f, out Vector3 safe))
+                return safe;
             return point;
         }
     }

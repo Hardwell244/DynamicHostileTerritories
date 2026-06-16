@@ -3,13 +3,12 @@ using DynamicHostileTerritories.Configuration;
 using DynamicHostileTerritories.Core;
 using DynamicHostileTerritories.Data;
 using Rage;
-using Rage.Native;
 
 namespace DynamicHostileTerritories.Services
 {
     /// <summary>
     /// Runs the live encounter inside an active territory. The gang starts as a LIVING
-    /// ambient presence (Observing) for every tier — patrolling, posted, loitering — and
+    /// ambient presence (Observing) for every tier - patrolling, posted, loitering - and
     /// only escalates as a REACTION when the player is noticed: the closer to the core,
     /// the longer they linger, drawing a weapon or firing pushes Observing -> Suspicious
     /// -> Provoked -> War. The tier controls how big/armed the presence is and how far
@@ -23,7 +22,7 @@ namespace DynamicHostileTerritories.Services
         {
             Quiet,   // armed presence, but they won't open fire unless the player does
             Tense,   // they'll aim up / encircle if you push, but don't fire first
-            Hostile  // ambush — they can open fire just for being here
+            Hostile  // ambush - they can open fire just for being here
         }
 
         private readonly PluginSettings _settings;
@@ -38,6 +37,13 @@ namespace DynamicHostileTerritories.Services
         private bool _reinforced;
         private bool _gripBrokenAnnounced;
         private EncounterProfile _profile;
+
+        // The turf is pre-loaded from far away (ActivationDistance) so the crew is staged
+        // before the player arrives. The "lingering" suspicion timer must only count time
+        // spent ACTUALLY inside the turf footprint - these track that.
+        private bool _playerInsideTurf;
+        private DateTime _playerInsideSinceUtc;
+        private bool _hasNotifiedEntry;
 
         private readonly Random _rng = new Random();
         private readonly AmbientEventDirector _events;
@@ -62,18 +68,16 @@ namespace DynamicHostileTerritories.Services
             _reinforced = false;
             _gripBrokenAnnounced = false;
             _eventTriggered = false;
+            _playerInsideTurf = false;
+            _hasNotifiedEntry = false;
             _nextEventCheckUtc = _enteredUtc.AddSeconds(20);
 
             _tier = _hostility.Evaluate(territory);
             territory.Hostility = _tier;
             _profile = RollProfile(_tier);
 
-            // 1. MOVA A NOTIFICAÇÃO E O LOG PARA CÁ! (Avisa o jogador na hora)
-            Logger.Info("Encounter begin at " + territory.Name + " — tier " + _tier
-                + ", mood " + _profile + ", strength " + (int)territory.Strength + "%, ambient presence staged.");
-            NotifyEntering(territory, _tier, _profile);
-
-            // 2. Agora sim ele vai gerar os NPCs com calma
+            // Pre-stage the gang while the player is still far away. NO entry notification
+            // here - that fires when the player actually crosses into the turf (EvaluateState).
             _spawnManager.Activate(territory, _tier);
 
             _state = EncounterState.Observing;
@@ -92,23 +96,33 @@ namespace DynamicHostileTerritories.Services
             _spawnManager.PruneDeadBlips();
             _events.Update();
 
-            // The crew breaks when only a fraction of the garrison is left standing — NOT
-            // at a fixed strength. The survivors then each react on their own (some hands
-            // up, some flee, some fight to the death) via BreakResolve.
             int garrison = Math.Max(1, _spawnManager.SpawnedPeds.Count);
             int breakAt = Math.Max(2, garrison / 4);
             int living = _spawnManager.LivingFighters;
             bool engaged = (int)_state >= (int)EncounterState.Provoked
-                           || territory.Strength < _settings.PacifiedBelow;
+                           || territory.Strength < _settings.PacifiedBelow
+                           || living < garrison; // any member down means the fight has started
 
-            if (engaged && living > 0 && living <= breakAt)
+            // The crew is finished when only a fraction is left standing OR everyone has been
+            // neutralised. Either way the turf is taken - so we PACIFY it here (strength to 0)
+            // instead of trusting the per-kill arithmetic to land exactly on zero. This is the
+            // fix for "killed everyone but it stayed at 9%" and "grip hit 0 but nobody broke".
+            if (engaged && living <= breakAt)
             {
-                if (!_gripBrokenAnnounced && _spawnManager.BreakResolve())
+                if (!_gripBrokenAnnounced)
                 {
                     _gripBrokenAnnounced = true;
-                    Logger.Info("Grip broken at " + territory.Name + " — crew scattered.");
+
+                    // If a few are still standing, run the scatter/surrender/flee resolve.
+                    if (living > 0)
+                        _spawnManager.BreakResolve();
+
+                    territory.Strength = 0f;
+                    territory.Hostility = HostilityLevel.Pacified;
+
+                    Logger.Info("Grip broken at " + territory.Name + " - turf pacified.");
                     Notifier.Show("Grip Broken", "~b~" + territory.ControllingGang.Name,
-                        "Their hold on ~y~" + territory.Name + "~w~ is breaking — some run, some fight, some give up.");
+                        "Their hold on " + territory.Name + " is broken.");
                 }
                 return;
             }
@@ -149,6 +163,8 @@ namespace DynamicHostileTerritories.Services
             _territory = null;
             _state = EncounterState.Observing;
             _reinforced = false;
+            _playerInsideTurf = false;
+            _hasNotifiedEntry = false;
         }
 
         public void ForcePacify()
@@ -203,11 +219,11 @@ namespace DynamicHostileTerritories.Services
             if (newTier == _tier)
                 return;
 
-            // FIX: Se o jogador já chamou a atenção (Suspicious, Provoked ou War),
-            // NÃO damos respawn na gangue para não fazer os inimigos sumirem no meio do tiro.
+            // If the player has already drawn attention (Suspicious, Provoked or War), do
+            // NOT respawn the gang - that would make enemies vanish in the middle of a fight.
             if (_state != EncounterState.Observing)
             {
-                // Apenas atualizamos as variáveis para o jogo registrar que enfraqueceu
+                // Just update the values so the world registers the turf has weakened.
                 _tier = newTier;
                 territory.Hostility = newTier;
                 return;
@@ -227,36 +243,90 @@ namespace DynamicHostileTerritories.Services
             if (player == null || !player.Exists() || !player.IsAlive)
                 return _state;
 
-            // The player drawing blood (or a downed member) tips ANY block into open war.
-            if (player.IsShooting || territory.RecentHeat >= 60f)
-                return EncounterState.War;
-
             float distance = player.Position.DistanceTo(territory.Center);
             float notice = NoticeRadius(_tier);
-            double dwellSeconds = (DateTime.UtcNow - _enteredUtc).TotalSeconds;
+
+            // Track whether the player is inside the turf footprint, and fire the one-shot
+            // "Entering <gang> Turf" notification on the way in (decoupled from the spawn,
+            // which happened far away during pre-load).
+            bool insideTurf = distance <= territory.Radius;
+            if (insideTurf)
+            {
+                if (!_playerInsideTurf)
+                {
+                    _playerInsideTurf = true;
+                    _playerInsideSinceUtc = DateTime.UtcNow;
+
+                    if (!_hasNotifiedEntry)
+                    {
+                        Logger.Info("Player entered turf at " + territory.Name + " - tier " + _tier
+                            + ", mood " + _profile + ", strength " + (int)territory.Strength + "%.");
+                        NotifyEntering(territory, _tier, _profile);
+                        _hasNotifiedEntry = true;
+                    }
+                }
+            }
+            else
+            {
+                _playerInsideTurf = false;
+                _hasNotifiedEntry = false; // re-arm so a later re-entry notifies again
+            }
+
+            // "Just driving through": if the player is in a vehicle moving at speed, the crew
+            // only watches - they do NOT open fire on someone passing on the street. Stopping,
+            // getting out, or going in on foot is what lets things escalate. This is the fix
+            // for being gunned down merely for driving past a turf.
+            bool passingThrough = false;
+            if (player.IsInAnyVehicle(false))
+            {
+                Vehicle veh = player.CurrentVehicle;
+                if (veh != null && veh.Exists() && veh.Speed > 9f) // ~32 km/h and up
+                    passingThrough = true;
+            }
+
+            // Confirmed action already happened in this turf (a shootout/arrest registered
+            // here) -> straight to war. A shot fired while inside is also a clear provocation,
+            // but only when you're actually IN the turf and not just speeding past.
+            if (territory.RecentHeat >= 75f)
+                return EncounterState.War;
+            if (player.IsShooting && _playerInsideTurf && !passingThrough)
+                return EncounterState.War;
+
+            double dwellSeconds = _playerInsideTurf
+                ? (DateTime.UtcNow - _playerInsideSinceUtc).TotalSeconds
+                : 0.0;
 
             EncounterState desired = EncounterState.Observing;
 
-            // Being noticed (lingering, or inside the notice radius) makes them watch you.
+            // Noticed (lingering inside the turf, or coming near the core): they watch you.
+            // No aggression - you can patrol straight through.
             if (dwellSeconds >= _settings.SuspicionDelaySeconds || distance <= notice)
                 desired = EncounterState.Suspicious;
 
-            // A tense/hostile block aims up or encircles when you get close or go armed.
-            if (_profile != EncounterProfile.Quiet
-                && (NativeFunction.Natives.IS_PED_ARMED<bool>(player, 7) || distance <= notice * 0.6f))
+            // Past this point the gang can go weapons-ready / open fire. None of it happens
+            // while the player is just driving past at speed.
+            if (passingThrough)
+                return desired;
+
+            // A tense/hostile block goes weapons-ready only if you push deep into the core
+            // AND have actually entered the turf on foot - not for being out on the street.
+            if (_profile != EncounterProfile.Quiet && _playerInsideTurf && distance <= notice * 0.45f)
                 desired = Max(desired, EncounterState.Provoked);
 
-            // Only a hostile block opens fire just for you being here — the ambush/fatal entry.
-            if (_profile == EncounterProfile.Hostile && distance <= notice * 0.5f)
+            // A hostile (ambush) block opens fire, but only deep in the core, inside the turf,
+            // and only after you've lingered a few seconds - no more instant fusillade for
+            // merely clipping the edge of the area.
+            if (_profile == EncounterProfile.Hostile && _playerInsideTurf
+                && distance <= notice * 0.30f && dwellSeconds >= 4.0)
                 desired = Max(desired, EncounterState.War);
 
             return desired;
         }
 
         /// <summary>
-        /// Rolls the per-visit mood. Weak turfs are usually quiet; strong turfs and the
-        /// night lean hostile — but every tier keeps a real chance of "nothing happens"
-        /// and of an ambush, so no two visits feel scripted.
+        /// Rolls the per-visit mood. Most visits are Quiet (you can patrol through), Tense
+        /// only reacts if you push into the core, and Hostile (ambush on sight) is rare -
+        /// it climbs at night and when the block has been stirred up recently.
         /// </summary>
         private EncounterProfile RollProfile(HostilityLevel tier)
         {
@@ -264,14 +334,18 @@ namespace DynamicHostileTerritories.Services
 
             switch (tier)
             {
-                case HostilityLevel.Warzone: quiet = 0.20; tense = 0.40; break;
-                case HostilityLevel.Aggressive: quiet = 0.35; tense = 0.45; break;
-                default: quiet = 0.55; tense = 0.40; break;
+                case HostilityLevel.Warzone: quiet = 0.55; tense = 0.35; break;     // hostile ~0.10
+                case HostilityLevel.Aggressive: quiet = 0.65; tense = 0.30; break;  // hostile ~0.05
+                default: quiet = 0.80; tense = 0.18; break;                         // Watchful hostile ~0.02
             }
 
-            // Night makes the streets meaner: shift weight out of quiet into hostile.
+            // Night and a recently stirred-up block lean meaner: shift out of quiet.
+            double meaner = 0.0;
             if (IsNight())
-                quiet = Math.Max(0.05, quiet - 0.15);
+                meaner += 0.12;
+            if (_territory != null && _territory.RecentHeat >= _settings.HeatThreshold)
+                meaner += 0.12;
+            quiet = Math.Max(0.20, quiet - meaner);
 
             double roll = _rng.NextDouble();
             if (roll < quiet) return EncounterProfile.Quiet;
@@ -293,9 +367,9 @@ namespace DynamicHostileTerritories.Services
         {
             switch (tier)
             {
-                case HostilityLevel.Warzone: return 80f;
-                case HostilityLevel.Aggressive: return 70f;
-                default: return 35f;
+                case HostilityLevel.Warzone: return 70f;
+                case HostilityLevel.Aggressive: return 55f;
+                default: return 30f;
             }
         }
 
@@ -311,7 +385,7 @@ namespace DynamicHostileTerritories.Services
             {
                 case EncounterProfile.Hostile: mood = "Something feels wrong here."; break;
                 case EncounterProfile.Tense: mood = "Armed crew, eyes on you."; break;
-                default: mood = "Quiet for now — stay sharp."; break;
+                default: mood = "Quiet for now - stay sharp."; break;
             }
 
             Notifier.Show("Entering " + territory.ControllingGang.Name + " Turf",

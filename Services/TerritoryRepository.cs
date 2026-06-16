@@ -54,7 +54,7 @@ namespace DynamicHostileTerritories.Services
                 {
                     def = BuildDefaults();
                     WriteDefaults(path, def);
-                    Game.LogTrivial("[DHT] No territories_setup.json found — wrote a default you can edit.");
+                    Game.LogTrivial("[DHT] No territories_setup.json found - wrote a default you can edit.");
                 }
                 else
                 {
@@ -64,7 +64,7 @@ namespace DynamicHostileTerritories.Services
                     if (def == null || def.Gangs == null || def.Territories == null
                         || def.Gangs.Count == 0 || def.Territories.Count == 0)
                     {
-                        Game.LogTrivial("[DHT] territories_setup.json empty/invalid — using built-in defaults.");
+                        Game.LogTrivial("[DHT] territories_setup.json empty/invalid - using built-in defaults.");
                         def = BuildDefaults();
                     }
                 }
@@ -79,7 +79,7 @@ namespace DynamicHostileTerritories.Services
 
             if (list.Count == 0)
             {
-                Game.LogTrivial("[DHT] No valid territories built — falling back to built-in defaults.");
+                Game.LogTrivial("[DHT] No valid territories built - falling back to built-in defaults.");
                 list = BuildFrom(BuildDefaults());
             }
 
@@ -114,7 +114,7 @@ namespace DynamicHostileTerritories.Services
 
                 if (!gangs.TryGetValue(t.Gang, out Gang gang))
                 {
-                    Game.LogTrivial("[DHT] Territory '" + t.Name + "' references unknown gang '" + t.Gang + "' — skipped.");
+                    Game.LogTrivial("[DHT] Territory '" + t.Name + "' references unknown gang '" + t.Gang + "' - skipped.");
                     continue;
                 }
 
@@ -124,11 +124,35 @@ namespace DynamicHostileTerritories.Services
                 list.Add(new Territory(t.Name, gang, new Vector3(t.X, t.Y, t.Z), radius)
                 {
                     Strength = strength,
-                    Hostility = HostilityLevel.Watchful
+                    Hostility = HostilityLevel.Watchful,
+                    IsStronghold = t.Stronghold
                 });
             }
 
+            EnsureStrongholds(list);
             return list;
+        }
+
+        /// <summary>
+        /// Guarantees every gang has exactly one home turf / redoubt. Honours any stronghold
+        /// already flagged in the setup file; for any gang without one (e.g. an older setup
+        /// file that predates the field), its first listed turf becomes the stronghold. This
+        /// way the redoubt mechanic works without the player having to delete their setup file.
+        /// </summary>
+        private static void EnsureStrongholds(List<Territory> list)
+        {
+            HashSet<Gang> covered = new HashSet<Gang>();
+            foreach (Territory t in list)
+                if (t.IsStronghold && t.ControllingGang != null)
+                    covered.Add(t.ControllingGang);
+
+            foreach (Territory t in list)
+            {
+                if (t.ControllingGang == null || covered.Contains(t.ControllingGang))
+                    continue;
+                t.IsStronghold = true; // first un-covered turf of this gang becomes its base
+                covered.Add(t.ControllingGang);
+            }
         }
 
         private static void WriteDefaults(string path, DefinitionFile def)
@@ -162,7 +186,7 @@ namespace DynamicHostileTerritories.Services
             };
         }
 
-        private static TerritoryDef T(string name, string gang, float x, float y, float z)
+        private static TerritoryDef T(string name, string gang, float x, float y, float z, bool stronghold = false)
         {
             return new TerritoryDef
             {
@@ -172,7 +196,8 @@ namespace DynamicHostileTerritories.Services
                 Y = y,
                 Z = z,
                 Radius = DefaultRadius,
-                Strength = _seedRng.Next(40, 91)
+                Strength = _seedRng.Next(40, 91),
+                Stronghold = stronghold
             };
         }
 
@@ -225,36 +250,36 @@ namespace DynamicHostileTerritories.Services
 
                 Territories = new List<TerritoryDef>
                 {
-                    T("Davis", "Ballas", 101.0282f, -1938.165f, 20.23903f),
+                    T("Davis", "Ballas", 101.0282f, -1938.165f, 20.23903f, true),
                     T("Strawberry", "Ballas", -23.34521f, -1826.804f, 25.11959f),
 
-                    T("Rancho", "Vagos", 292.8668f, -2000.102f, 19.80942f),
+                    T("Rancho", "Vagos", 292.8668f, -2000.102f, 19.80942f, true),
                     T("Cypress Flats", "Vagos", 490.5248f, -1779.046f, 27.85685f),
                     T("El Burro Heights", "Vagos", 944.0488f, -1854.581f, 30.53767f),
 
-                    T("Murrieta Heights", "Marabunta Grande", 1283.708f, -1734.576f, 51.98082f),
+                    T("Murrieta Heights", "Marabunta Grande", 1283.708f, -1734.576f, 51.98082f, true),
                     T("Murrieta Oil Field", "Marabunta Grande", 1212.528f, -1631.301f, 46.61679f),
                     T("Vespucci Canals", "Marabunta Grande", -1121.539f, -1562.336f, 3.701513f),
 
-                    T("Little Seoul", "Kkangpae", -754.5678f, -920.0692f, 18.44455f),
+                    T("Little Seoul", "Kkangpae", -754.5678f, -920.0692f, 18.44455f, true),
 
-                    T("La Puerta", "Armenian Mob", -605.262f, -1797.159f, 22.90413f),
+                    T("La Puerta", "Armenian Mob", -605.262f, -1797.159f, 22.90413f, true),
 
-                    T("Vinewood Hills", "Madrazo Cartel", 1370.042f, 1146.712f, 113.1948f),
+                    T("Vinewood Hills", "Madrazo Cartel", 1370.042f, 1146.712f, 113.1948f, true),
 
-                    T("Grapeseed", "Varrios Los Aztecas", 1889.336f, 3821.397f, 31.74322f),
+                    T("Grapeseed", "Varrios Los Aztecas", 1889.336f, 3821.397f, 31.74322f, true),
                     T("Paleto Bay", "Varrios Los Aztecas", -214.2826f, 6428.561f, 30.86472f),
                     T("Chumash", "Varrios Los Aztecas", -3228.169f, 1085.752f, 10.16032f),
 
-                    T("Chamberlain Hills", "Families", -14.71192f, -1457.348f, 29.88582f),
+                    T("Chamberlain Hills", "Families", -14.71192f, -1457.348f, 29.88582f, true),
                     T("Carson Avenue", "Families", -179.4559f, -1589.602f, 34.08165f),
 
                     T("Mirror Park", "The Lost MC", 971.0652f, -126.2237f, 73.77003f),
-                    T("Sandy Shores", "The Lost MC", 72.5417f, 3710.01f, 39.75491f),
+                    T("Sandy Shores", "The Lost MC", 72.5417f, 3710.01f, 39.75491f, true),
                     T("Great Chaparral", "The Lost MC", -2199.119f, 4295.706f, 47.94391f),
 
                     T("Grapeseed Farms", "Rednecks", 952.0675f, 3618.137f, 32.55708f),
-                    T("Grand Senora Desert", "Rednecks", 591.8459f, 2739.823f, 42.07438f),
+                    T("Grand Senora Desert", "Rednecks", 591.8459f, 2739.823f, 42.07438f, true),
                     T("Mount Chiliad", "Rednecks", 1669.691f, 4769.295f, 41.84365f)
                 }
             };
@@ -287,6 +312,7 @@ namespace DynamicHostileTerritories.Services
             public float Z { get; set; }
             public float Radius { get; set; }
             public float Strength { get; set; }
+            public bool Stronghold { get; set; } // gang home turf / redoubt - the sim never conquers it
         }
     }
 }

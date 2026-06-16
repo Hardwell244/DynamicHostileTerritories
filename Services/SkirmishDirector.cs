@@ -11,7 +11,9 @@ namespace DynamicHostileTerritories.Services
     /// A self-contained gang-vs-gang skirmish: a rival crew rolls into an active turf and
     /// fights the controlling gang. Both sides are their own peds in their own relationship
     /// groups, neutral to the player and cops, so killing them does NOT move the grip — the
-    /// player can watch or wade in. Owns and cleans up everything it spawns.
+    /// player can watch or wade in. Owns and cleans up everything it spawns. Placement and
+    /// combat go through the shared SpawnPlacement / CombatProfile helpers, so the rival
+    /// crew is no longer a wall of laser-accurate gunmen out of step with the turf garrison.
     /// </summary>
     public sealed class SkirmishDirector
     {
@@ -120,9 +122,10 @@ namespace DynamicHostileTerritories.Services
 
             for (int i = 0; i < count; i++)
             {
-                Vector3 p = RandomPointAround(around, 5f);
-                if (NativeFunction.Natives.GET_SAFE_COORD_FOR_PED<bool>(p.X, p.Y, p.Z, true, out Vector3 safe, 0))
-                    p = safe;
+                // Shared placement: grounded, navmesh-safe, kept 28m off the player. If
+                // nothing safe resolves we SKIP this one rather than drop it into a wall.
+                if (!SpawnPlacement.TryResolve(around, 6f, 28f, out Vector3 p))
+                    continue;
 
                 string model = models[_rng.Next(models.Count)];
 
@@ -143,7 +146,7 @@ namespace DynamicHostileTerritories.Services
                 ped.IsPersistent = true;
                 ped.BlockPermanentEvents = false;
                 ped.RelationshipGroup = group;
-                ped.Accuracy = 25;
+                CombatProfile.Apply(ped, CombatProfile.Tier.Standard); // same feel as an Aggressive grunt
                 ped.Inventory.GiveNewWeapon("weapon_microsmg", -1, true);
 
                 _peds.Add(ped);
@@ -163,15 +166,6 @@ namespace DynamicHostileTerritories.Services
             double angle = baseAngle + jitter;
             float distance = radius * spreadFactor * (0.5f + (float)_rng.NextDouble() * 0.8f);
 
-            float x = center.X + (float)Math.Cos(angle) * distance;
-            float y = center.Y + (float)Math.Sin(angle) * distance;
-            return new Vector3(x, y, center.Z);
-        }
-
-        private Vector3 RandomPointAround(Vector3 center, float radius)
-        {
-            double angle = _rng.NextDouble() * Math.PI * 2.0;
-            float distance = (float)(_rng.NextDouble() * radius);
             float x = center.X + (float)Math.Cos(angle) * distance;
             float y = center.Y + (float)Math.Sin(angle) * distance;
             return new Vector3(x, y, center.Z);

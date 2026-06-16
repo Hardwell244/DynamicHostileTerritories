@@ -26,7 +26,6 @@ namespace DynamicHostileTerritories.Configuration
         public int UpdateIntervalMs { get; private set; }
 
         // --- Territory control ---
-        public float PoliceActionStrengthDrop { get; private set; }
         public float StrengthRegrowthPerHour { get; private set; }
         public float SuppressionHours { get; private set; }
 
@@ -68,7 +67,6 @@ namespace DynamicHostileTerritories.Configuration
                 s.MaxSpawnedPeds = ini.ReadInt32("Performance", "MaxSpawnedPeds", 10);
                 s.UpdateIntervalMs = ini.ReadInt32("Performance", "UpdateIntervalMs", 750);
 
-                s.PoliceActionStrengthDrop = ini.ReadSingle("Territory", "PoliceActionStrengthDrop", 15f);
                 s.StrengthRegrowthPerHour = ini.ReadSingle("Territory", "StrengthRegrowthPerHour", 4f);
                 s.SuppressionHours = ini.ReadSingle("Territory", "SuppressionHours", 6f);
 
@@ -95,7 +93,6 @@ namespace DynamicHostileTerritories.Configuration
                 s.ActivationDistance = 150f;
                 s.MaxSpawnedPeds = 10;
                 s.UpdateIntervalMs = 1500;
-                s.PoliceActionStrengthDrop = 15f;
                 s.StrengthRegrowthPerHour = 4f;
                 s.SuppressionHours = 6f;
                 s.SuspicionDelaySeconds = 12f;

@@ -70,18 +70,30 @@ namespace DynamicHostileTerritories.Services
             }
         }
 
-        /// <summary>Removes blips for any ped that has died or despawned.</summary>
+        /// <summary>Removes blips for any ped that has died, despawned or been arrested.</summary>
         public void Prune()
         {
             List<Ped> gone = null;
 
             foreach (KeyValuePair<Ped, Blip> kv in _blips)
             {
-                // Dead, despawned OR cuffed: an arrested ped (e.g. via StopThePed) is
-                // still alive and present, so without this its blip would linger.
-                if (!kv.Key.Exists() || kv.Key.IsDead || Functions.IsPedArrested(kv.Key))
+                bool remove;
+                try
                 {
-                    if (kv.Value.Exists()) kv.Value.Delete();
+                    // Dead, despawned OR cuffed: an arrested ped (e.g. via StopThePed) is
+                    // still alive and present, so without this its blip would linger.
+                    remove = kv.Key == null || !kv.Key.Exists() || kv.Key.IsDead
+                             || Functions.IsPedArrested(kv.Key);
+                }
+                catch
+                {
+                    remove = true; // anything odd about the handle: drop its blip
+                }
+
+                if (remove)
+                {
+                    try { if (kv.Value != null && kv.Value.Exists()) kv.Value.Delete(); }
+                    catch { }
                     (gone ?? (gone = new List<Ped>())).Add(kv.Key);
                 }
             }
@@ -95,7 +107,10 @@ namespace DynamicHostileTerritories.Services
         public void Clear()
         {
             foreach (KeyValuePair<Ped, Blip> kv in _blips)
-                if (kv.Value.Exists()) kv.Value.Delete();
+            {
+                try { if (kv.Value != null && kv.Value.Exists()) kv.Value.Delete(); }
+                catch { }
+            }
             _blips.Clear();
         }
     }

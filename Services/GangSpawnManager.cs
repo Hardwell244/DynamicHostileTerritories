@@ -14,7 +14,7 @@ namespace DynamicHostileTerritories.Services
     /// provoked, mobile members peel off to ambush/encircle the player; when a war is
     /// nearly lost the survivors can surrender. The ambient presence runs continuously;
     /// the EncounterDirector layers alert/combat on top. Nothing it spawns outlives
-    /// Deactivate().
+    /// Deactivate(). All combat stats/brain come from the shared CombatProfile.
     /// </summary>
     public sealed class GangSpawnManager
     {
@@ -32,6 +32,10 @@ namespace DynamicHostileTerritories.Services
         {
             "weapon_carbinerifle", "weapon_assaultrifle", "weapon_specialcarbine", "weapon_smg", "weapon_pumpshotgun"
         };
+
+        // Minimum distance any spawned ped must be from the player. Combined with the strict
+        // SpawnPlacement.TryResolve, this is what stops peds materialising in the player's face.
+        private const float MinSpawnDistanceFromPlayer = 40f;
 
         // Gang-vs-gang skirmish, fully owned by its own director (separate peds/groups).
         private readonly SkirmishDirector _skirmish = new SkirmishDirector();
@@ -80,7 +84,7 @@ namespace DynamicHostileTerritories.Services
 
         /// <summary>
         /// Spawns and stages the gang for the given tier. Spawns are staggered across
-        /// frames. Behaviour is NOT set here — call ApplyPosture next.
+        /// frames. Behaviour is NOT set here - call ApplyPosture next.
         /// </summary>
         public void Activate(Territory territory, HostilityLevel tier)
         {
@@ -102,6 +106,11 @@ namespace DynamicHostileTerritories.Services
 
             _gangGroup = _relationships.SetupGang(territory.ControllingGang.Name);
             _hasGangGroup = true;
+
+            // Force the turf's navmesh/collision to stream in NOW (the player may still be far
+            // away), so every ped resolves a real point INSIDE the turf instead of failing at
+            // range and being dumped onto a far street outside the blip.
+            SpawnPlacement.EnsureNavmesh(territory.Center, territory.Radius);
 
             int desired = Math.Min(PedCountFor(tier), _maxPeds);
 
@@ -131,8 +140,10 @@ namespace DynamicHostileTerritories.Services
                 else if (i < guards + patrols + sentries) role = Role.Sentry;
                 else role = Role.Loiter;
 
+                // Roadblock guards cluster (loosely) around the car; everyone else is spread
+                // evenly around the ring so the turf doesn't spawn three peds on one spot.
                 Vector3 pos = (role == Role.Guard && _hasRoadblock)
-                    ? RandomPointAround(_roadblockPos, 4f)
+                    ? RandomPointAround(_roadblockPos, 7f)
                     : RingPoint(territory.Center, territory.Radius, i, crew);
 
                 if (SpawnMember(pos, role, tier))
@@ -159,26 +170,15 @@ namespace DynamicHostileTerritories.Services
         }
 
         /// <summary>
-        /// One extra wave of fighters from the edges of the turf when war erupts.
-        /// Tasked by the next ApplyPosture(War) call.
+        /// Reinforcements are now part of the INITIAL garrison: the full crew is staged when
+        /// the turf activates (while the player is still approaching, with the navmesh forced
+        /// to load), so nothing "drives in" and materialises behind the player mid-fight.
+        /// Kept as a no-op so the EncounterDirector's call site does not need to change.
         /// </summary>
         public void Reinforce(Territory territory, HostilityLevel tier)
         {
-            if (!_hasGangGroup)
-                return;
-
-            int wave = tier >= HostilityLevel.Warzone ? 6 : 4;
-            int spawned = 0;
-
-            for (int i = 0; i < wave; i++)
-            {
-                Vector3 pos = RingPoint(territory.Center, territory.Radius, i, wave, 0.9f);
-                if (SpawnMember(pos, Role.Guard, tier))
-                    spawned++;
-                GameFiber.Sleep(80);
-            }
-
-            Logger.Info("Reinforcements arrived at " + territory.Name + ": " + spawned + " extra fighters.");
+            // Intentionally empty - see summary. Pre-staging the whole garrison up front is
+            // what removes the "ped spawning on my back out of nowhere" problem.
         }
 
         /// <summary>Number of members still alive and able to fight.</summary>
@@ -196,7 +196,7 @@ namespace DynamicHostileTerritories.Services
         /// <summary>
         /// The crew throws in the towel: stands down, hands up, no longer hostile to the
         /// player or cops, so the survivors can be cuffed (arrests still drop the grip).
-        /// Idempotent — returns true only on the transition into surrender.
+        /// Idempotent - returns true only on the transition into surrender.
         /// </summary>
         public bool Surrender()
         {
@@ -228,7 +228,7 @@ namespace DynamicHostileTerritories.Services
         /// throwing their hands up, each survivor reacts on its own: ~40% surrender (hands
         /// up), ~30% flee, ~30% fight to the death. Surrendering/fleeing peds are moved to
         /// a neutral group so they stop being hostile, while the diehards stay in the gang
-        /// group and keep fighting. Idempotent — returns true only on the first call.
+        /// group and keep fighting. Idempotent - returns true only on the first call.
         /// </summary>
         public bool BreakResolve()
         {
@@ -296,7 +296,7 @@ namespace DynamicHostileTerritories.Services
         /// <summary>
         /// A rival crew rolls into the turf and fights the controlling gang. These are
         /// their own peds in their own groups (neutral to the player and cops) and are
-        /// NOT part of the encounter — killing them does not move the grip. The player can
+        /// NOT part of the encounter - killing them does not move the grip. The player can
         /// just watch the two sides go at it, or wade in. Returns true if it started.
         /// </summary>
         public bool TriggerSkirmish(Territory territory)
@@ -375,7 +375,7 @@ namespace DynamicHostileTerritories.Services
                 return;
 
             if (_surrendered)
-                return; // hands up — never re-task them back into the fight
+                return; // hands up - never re-task them back into the fight
 
             ApplyRelationship(state);
 
@@ -392,7 +392,8 @@ namespace DynamicHostileTerritories.Services
         {
             string model = Pick(_territory.ControllingGang.PedModels);
 
-            Vector3 spawnPos = ResolveSpawnPoint(around);
+            if (!TryResolveSpawnPoint(around, out Vector3 spawnPos))
+                return false; // no safe point inside the turf away from the player - spawn one fewer
 
             float heading = _rng.Next(0, 360);
 
@@ -418,7 +419,7 @@ namespace DynamicHostileTerritories.Services
             ped.IsPersistent = true;
             ped.BlockPermanentEvents = true;
             ped.RelationshipGroup = _gangGroup;
-            ApplyStats(ped, tier);
+            CombatProfile.Apply(ped, CombatProfile.FromHostility(tier));
             ped.Inventory.GiveNewWeapon(weapon, -1, false); // holstered until staged/alerted
 
             // Grunt blips are created on demand only when the crew turns hostile
@@ -429,15 +430,16 @@ namespace DynamicHostileTerritories.Services
         }
 
         /// <summary>
-        /// Spawns the area lieutenant: a tougher, well-armed boss using the gang's boss/
-        /// lieutenant model when it has one. Its gold blip is created on demand by the blip
-        /// manager. The controller treats this ped specially — neutralising them craters the grip.
+        /// Spawns the area lieutenant: a tougher boss using the gang's boss/lieutenant model
+        /// when it has one. Its gold blip is created on demand by the blip manager. The
+        /// controller treats this ped specially - neutralising them craters the grip.
         /// </summary>
         private bool SpawnBoss(Vector3 around, HostilityLevel tier)
         {
             string model = PickBossModel(_territory.ControllingGang.PedModels);
 
-            Vector3 spawnPos = ResolveSpawnPoint(around);
+            if (!TryResolveSpawnPoint(around, out Vector3 spawnPos))
+                return false; // no safe point - skip the boss rather than drop it badly
 
             Ped ped;
             try
@@ -461,10 +463,9 @@ namespace DynamicHostileTerritories.Services
             ped.IsPersistent = true;
             ped.BlockPermanentEvents = true;
             ped.RelationshipGroup = _gangGroup;
-            ped.Accuracy = 65;
-            ped.Armor = 100;
             ped.MaxHealth = 400;
             ped.Health = 400;
+            CombatProfile.Apply(ped, CombatProfile.Tier.Boss); // tougher-but-not-aimbot brain + accuracy + armour
             ped.Inventory.GiveNewWeapon(bossWeapon, -1, false);
 
             Member boss = new Member
@@ -533,25 +534,6 @@ namespace DynamicHostileTerritories.Services
             }
         }
 
-        private void ApplyStats(Ped ped, HostilityLevel tier)
-        {
-            switch (tier)
-            {
-                case HostilityLevel.Watchful:
-                    ped.Accuracy = 15;
-                    ped.Armor = 0;
-                    break;
-                case HostilityLevel.Aggressive:
-                    ped.Accuracy = 30;
-                    ped.Armor = 25;
-                    break;
-                case HostilityLevel.Warzone:
-                    ped.Accuracy = 40;
-                    ped.Armor = 75;
-                    break;
-            }
-        }
-
         private void ApplyRelationship(EncounterState state)
         {
             _relationships.SetHostility(_gangGroup, state);
@@ -588,13 +570,13 @@ namespace DynamicHostileTerritories.Services
             return options[_rng.Next(options.Count)];
         }
 
-        private Vector3 RingPoint(Vector3 center, float radius, int index, int count, float spreadFactor = 0.6f)
+        private Vector3 RingPoint(Vector3 center, float radius, int index, int count, float spreadFactor = 0.9f)
         {
             // Spread members around the core so the turf feels occupied as you push in.
             double baseAngle = (index / (double)Math.Max(1, count)) * Math.PI * 2.0;
             double jitter = (_rng.NextDouble() - 0.5) * 0.7;
             double angle = baseAngle + jitter;
-            float distance = radius * spreadFactor * (0.5f + (float)_rng.NextDouble() * 0.8f);
+            float distance = radius * spreadFactor * (0.55f + (float)_rng.NextDouble() * 0.5f);
 
             float x = center.X + (float)Math.Cos(angle) * distance;
             float y = center.Y + (float)Math.Sin(angle) * distance;
@@ -611,27 +593,40 @@ namespace DynamicHostileTerritories.Services
         }
 
         /// <summary>
-        /// Resolves a usable spawn point near 'around'. GET_SAFE_COORD_FOR_PED sometimes
-        /// returns a point inside an inaccessible structure (common in dense built-up
-        /// blocks), so we try a few candidates and, if none resolve cleanly, drop the ped
-        /// on the nearest street instead of trapping it inside a building.
+        /// Resolves a usable spawn point near 'around' via the shared SpawnPlacement helper.
+        /// We bias the INPUT inside the turf, then accept ONLY a navmesh-safe point that is
+        /// also a safe distance from the player. There is NO blind street fallback any more
+        /// (that was what scattered peds outside the blip): if nothing qualifies we return
+        /// false and the caller simply spawns one ped fewer.
         /// </summary>
-        private Vector3 ResolveSpawnPoint(Vector3 around)
+        private bool TryResolveSpawnPoint(Vector3 around, out Vector3 pos)
         {
-            for (int attempt = 0; attempt < 5; attempt++)
+            around = ClampToTurf(around);
+            return SpawnPlacement.TryResolve(around, _territory.Radius * 0.45f, MinSpawnDistanceFromPlayer, out pos);
+        }
+
+        /// <summary>
+        /// Pulls a point back inside the turf radius (95% of it). Applied to the spawn INPUT
+        /// only, never to a resolved safe coord - clamping a safe coord is what used to push
+        /// peds into a neighbouring building.
+        /// </summary>
+        private Vector3 ClampToTurf(Vector3 p)
+        {
+            if (_territory == null)
+                return p;
+
+            Vector3 c = _territory.Center;
+            float dx = p.X - c.X;
+            float dy = p.Y - c.Y;
+            float dist = (float)Math.Sqrt(dx * dx + dy * dy);
+            float max = _territory.Radius * 0.95f;
+
+            if (dist > max && dist > 0.01f)
             {
-                Vector3 candidate = attempt == 0
-                    ? around
-                    : RandomPointAround(around, _territory.Radius * 0.5f);
-
-                if (NativeFunction.Natives.GET_SAFE_COORD_FOR_PED<bool>(
-                        candidate.X, candidate.Y, candidate.Z, true, out Vector3 safe, 0))
-                    return safe;
+                float scale = max / dist;
+                return new Vector3(c.X + dx * scale, c.Y + dy * scale, p.Z);
             }
-
-            // Dense building cluster — nothing safe nearby. A street edge is always
-            // reachable, which is far better than spawning sealed inside a structure.
-            return World.GetNextPositionOnStreet(around);
+            return p;
         }
     }
 }

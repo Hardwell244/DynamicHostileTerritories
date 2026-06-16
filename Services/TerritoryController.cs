@@ -37,6 +37,15 @@ namespace DynamicHostileTerritories.Services
 
         public Territory ActiveTerritory => _activeTerritory;
 
+        /// <summary>Optional gang-retaliation director, notified when the player hits a turf.</summary>
+        public RetaliationDirector Retaliation { get; set; }
+
+        /// <summary>
+        /// Optional city meta-sim. When set, the player's police actions bleed the hit gang's
+        /// war chest, so hitting a turf cripples the gang's ability to conquer elsewhere.
+        /// </summary>
+        public GangWarfareDirector Warfare { get; set; }
+
         public TerritoryController(
             PluginSettings settings,
             TerritoryRepository repository,
@@ -155,14 +164,16 @@ namespace DynamicHostileTerritories.Services
 
         /// <summary>
         /// Picks the active territory with hysteresis: once inside one, we keep it until
-        /// the player is clearly outside its leave radius. This stops the encounter from
+        /// the player is clearly outside its activation range. This stops the encounter from
         /// flip-flopping (and constantly respawning) between two nearby turfs.
         /// </summary>
         private Territory ResolveActiveTerritory(Vector3 playerPos)
         {
             if (_activeTerritory != null)
             {
-                float leaveDistance = _settings.ActivationDistance * 1.3f;
+                // Leave a bit further out than we entered (hysteresis), based on the
+                // ActivationDistance preload radius — NOT the small turf radius.
+                float leaveDistance = _settings.ActivationDistance * 1.2f;
                 if (playerPos.DistanceTo(_activeTerritory.Center) <= leaveDistance)
                     return _activeTerritory;
             }
@@ -173,12 +184,17 @@ namespace DynamicHostileTerritories.Services
         private Territory FindActiveTerritory(Vector3 playerPos)
         {
             Territory best = null;
-            float bestDistance = _settings.ActivationDistance;
+            float bestDistance = float.MaxValue;
 
             foreach (Territory t in _repository.Territories)
             {
                 float distance = playerPos.DistanceTo(t.Center);
-                if (distance <= bestDistance)
+
+                // Activation uses ActivationDistance from the .ini (not the small turf
+                // radius), so a turf activates and PRE-LOADS its peds while the player is
+                // still far away. By the time the player reaches the area the crew is
+                // already in place instead of popping in right on top of them.
+                if (distance <= _settings.ActivationDistance && distance < bestDistance)
                 {
                     best = t;
                     bestDistance = distance;
@@ -230,17 +246,16 @@ namespace DynamicHostileTerritories.Services
 
             foreach (Ped ped in _spawnManager.SpawnedPeds)
             {
-                // Trava de segurança que adicionamos:
+                // Safety guard: skip dead/despawned handles.
                 if (ped == null || !ped.Exists())
                     continue;
 
                 if (_countedNeutralised.Contains(ped))
                     continue;
 
-                // SÓ conta se VOCÊ neutralizou: preso, OU morto por dano causado por você.
-                // Assim morte por fogo amigo / skirmish / queda NÃO derruba o grip sozinha.
+                // Only count it if YOU neutralised them: arrested, OR killed by your damage.
+                // That way friendly fire / skirmish / falls do NOT drop the grip on their own.
                 bool arrested = Functions.IsPedArrested(ped);
-                // DEPOIS
                 bool killedByPlayer = false;
                 if (ped.IsDead && playerOk)
                 {
@@ -273,13 +288,20 @@ namespace DynamicHostileTerritories.Services
                     territory.LastPoliceActionUtc = now;
                     territory.RecentHeat = 100f;
 
-                    // Grudge: hit one of a gang's turfs and the whole gang gets angrier
+                    // The hit gang holds a grudge — a hit squad may come for the player later.
+                    Retaliation?.RegisterAggravation(territory.ControllingGang);
+
+                    // Player pressure also bleeds the gang's city-wide war chest, so hitting
+                    // a turf cripples its ability to conquer elsewhere (a lieutenant hits hard).
+                    Warfare?.DrainWarChest(territory.ControllingGang, isBoss);
+
+                    // Grudge: hit one of a gang's turfs and the whole gang gets angrier.
                     foreach (Territory other in _repository.Territories)
                     {
                         if (other == territory)
                             continue;
                         if (other.ControllingGang == territory.ControllingGang)
-                            other.RecentHeat = Math.Min(100f, other.RecentHeat + (isBoss ? 40f : 25f));
+                            other.RecentHeat = Math.Min(100f, other.RecentHeat + (isBoss ? 20f : 15f));
                     }
 
                     if (isBoss)

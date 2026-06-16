@@ -10,9 +10,9 @@ namespace DynamicHostileTerritories.UI
 {
     /// <summary>
     /// LemonUI interaction menu. Shows the live status of the territory the player is in,
-    /// a city-wide gang-control overview, and exposes force-pacify plus a live map layer
-    /// that paints every turf by its controlling gang and grip — so the player can watch
-    /// the city being reclaimed as they pacify areas. Owns its blips; cleans them on Dispose.
+    /// a city-wide gang-control overview, a gang-intelligence board (who to hit first, plus
+    /// allies/rivals/wars), force-pacify, and a live map layer that paints every turf by its
+    /// controlling gang and grip. Owns its blips; cleans them on Dispose.
     /// </summary>
     public sealed class InteractionMenu
     {
@@ -33,9 +33,11 @@ namespace DynamicHostileTerritories.UI
 
         private NativeMenu _menu;
         private NativeMenu _controlMenu;
+        private NativeMenu _intelMenu;
         private NativeItem _statusItem;
         private NativeItem _pacifyItem;
         private NativeItem _controlItem;
+        private NativeItem _intelItem;
         private NativeCheckboxItem _blipsItem;
 
         public InteractionMenu(PluginSettings settings, TerritoryController controller, TerritoryRepository repository, GangWarfareDirector warfare)
@@ -54,6 +56,9 @@ namespace DynamicHostileTerritories.UI
 
             _controlMenu = new NativeMenu("Hostile Territories", "City Control");
             _pool.Add(_controlMenu);
+
+            _intelMenu = new NativeMenu("Hostile Territories", "Gang Intelligence");
+            _pool.Add(_intelMenu);
 
             _statusItem = new NativeItem("Current Area", "The territory you are currently inside.")
             {
@@ -74,16 +79,25 @@ namespace DynamicHostileTerritories.UI
             };
             _menu.Add(_controlItem);
 
+            _intelItem = new NativeItem("Gang Intelligence", "Rank gangs by power, see who to hit first, plus their allies, rivals and current wars.");
+            _intelItem.Activated += (sender, args) =>
+            {
+                PopulateIntelMenu();
+                _menu.Visible = false;
+                _intelMenu.Visible = true;
+            };
+            _menu.Add(_intelItem);
+
             _blipsItem = new NativeCheckboxItem(
                 "Show Territory Map",
                 "Paint every gang turf on the map. Bold = strong grip, faint = pacified.",
                 false
             );
 
-            // 1. Conecta a caixa de seleção à função que cria/deleta os blips no mapa
+            // Wire the checkbox to the map blip layer (create / delete blips).
             _blipsItem.CheckboxChanged += (sender, args) => SetBlips(_blipsItem.Checked);
 
-            // 2. Adiciona o botão de fato ao menu visível
+            // Add the item to the visible menu.
             _menu.Add(_blipsItem);
         }
 
@@ -117,8 +131,8 @@ namespace DynamicHostileTerritories.UI
                 return;
             }
 
-            _statusItem.AltTitle = active.ControllingGang.Name;
-            _statusItem.Description = active.Name + " — threat " + active.Hostility
+            _statusItem.AltTitle = active.ControllingGang != null ? active.ControllingGang.Name : "Unknown";
+            _statusItem.Description = active.Name + " - threat " + active.Hostility
                 + ", gang grip " + (int)active.Strength + "%.";
             _pacifyItem.Enabled = true;
         }
@@ -135,6 +149,9 @@ namespace DynamicHostileTerritories.UI
 
             foreach (Territory t in _repository.Territories)
             {
+                if (t.ControllingGang == null)
+                    continue; // a null owner can never be a dictionary key - skip it
+
                 totalTurfs++;
                 bool pacified = IsPacified(t);
                 if (pacified) totalPacified++;
@@ -152,8 +169,11 @@ namespace DynamicHostileTerritories.UI
 
             int reclaimedPct = totalTurfs > 0 ? (totalPacified * 100) / totalTurfs : 0;
 
+            Gang kingpin = _warfare != null ? _warfare.Kingpin : null;
+
             NativeItem header = new NativeItem("City Reclaimed",
-                "Turfs you've pacified across Los Santos.")
+                "Turfs you've pacified across Los Santos."
+                + (kingpin != null ? " Most-wanted gang: " + kingpin.Name + "." : ""))
             {
                 AltTitle = reclaimedPct + "%",
                 Enabled = false
@@ -172,14 +192,115 @@ namespace DynamicHostileTerritories.UI
 
                 NativeItem item = new NativeItem(kv.Key.Name,
                     "Average grip " + avgGrip + "%. " + gc.Pacified + " of " + gc.Total + " turfs pacified."
-                    + " War chest — money " + (int)info.Money + ", influence " + (int)info.Influence
+                    + " War chest - money " + (int)info.Money + ", influence " + (int)info.Influence
                     + ", weapons " + (int)info.Weapons + ".")
                 {
+                    // Keep the AltTitle SHORT so a long gang name never collides with it.
                     AltTitle = held + "/" + gc.Total + " held  |  PWR " + (int)info.Power,
                     Enabled = false
                 };
                 _controlMenu.Add(item);
             }
+        }
+
+        // --- Gang intelligence board ------------------------------------------------------
+
+        private void PopulateIntelMenu()
+        {
+            _intelMenu.Clear();
+
+            Gang kingpin = _warfare != null ? _warfare.Kingpin : null;
+            GangDiplomacy dip = _warfare != null ? _warfare.Diplomacy : null;
+
+            // Count holdings per gang.
+            Dictionary<Gang, int> held = new Dictionary<Gang, int>();
+            foreach (Territory t in _repository.Territories)
+            {
+                if (t.ControllingGang == null)
+                    continue;
+                int c;
+                held.TryGetValue(t.ControllingGang, out c);
+                held[t.ControllingGang] = c + 1;
+            }
+
+            // Rank by power, strongest first - that's the order to hit them in.
+            List<Gang> gangs = new List<Gang>(held.Keys);
+            gangs.Sort((a, b) => Power(b).CompareTo(Power(a)));
+
+            NativeItem header = new NativeItem("Intelligence Board",
+                kingpin != null
+                    ? "Most-wanted gang: " + kingpin.Name + ". Hit their people to drain their war chest and stall their expansion."
+                    : "No dominant gang right now.")
+            {
+                AltTitle = gangs.Count + " gangs",
+                Enabled = false
+            };
+            _intelMenu.Add(header);
+
+            int total = gangs.Count;
+            for (int i = 0; i < total; i++)
+            {
+                Gang g = gangs[i];
+                GangWarfareDirector.PowerInfo info = _warfare != null
+                    ? _warfare.GetPower(g)
+                    : new GangWarfareDirector.PowerInfo();
+                int turfs = held[g];
+
+                string badge;
+                string threat;
+                if (kingpin != null && g == kingpin)
+                {
+                    badge = "KINGPIN";
+                    threat = "KINGPIN - the dominant gang, top priority.";
+                }
+                else if (i <= total / 3)
+                {
+                    badge = "HIGH";
+                    threat = "HIGH THREAT.";
+                }
+                else if (i <= (2 * total) / 3)
+                {
+                    badge = "ACTIVE";
+                    threat = "ACTIVE.";
+                }
+                else
+                {
+                    badge = "FADING";
+                    threat = "FADING.";
+                }
+
+                string allies = dip != null ? Names(dip.Allies(g)) : "";
+                string enemies = dip != null ? Names(dip.Enemies(g)) : "";
+                Gang warTarget = _warfare != null ? _warfare.CurrentWarTarget(g) : null;
+
+                string desc = threat
+                    + " PWR " + (int)info.Power + ", " + turfs + (turfs == 1 ? " turf" : " turfs") + " held."
+                    + " War chest - money " + (int)info.Money + ", weapons " + (int)info.Weapons + "."
+                    + " Allies: " + (allies.Length > 0 ? allies : "none") + "."
+                    + " Rivals: " + (enemies.Length > 0 ? enemies : "none") + "."
+                    + (warTarget != null ? " At war with " + warTarget.Name + "." : "");
+
+                NativeItem item = new NativeItem(g.Name, desc)
+                {
+                    AltTitle = badge, // kept short on purpose so it never collides with the name
+                    Enabled = false
+                };
+                _intelMenu.Add(item);
+            }
+        }
+
+        private double Power(Gang gang)
+        {
+            return _warfare != null ? _warfare.GetPower(gang).Power : 0.0;
+        }
+
+        private static string Names(IEnumerable<Gang> gangs)
+        {
+            List<string> names = new List<string>();
+            foreach (Gang g in gangs)
+                if (g != null)
+                    names.Add(g.Name);
+            return string.Join(", ", names);
         }
 
         // --- Live map layer ---------------------------------------------------------------
@@ -193,11 +314,18 @@ namespace DynamicHostileTerritories.UI
 
                 foreach (Territory t in _repository.Territories)
                 {
-                    Blip blip = new Blip(t.Center, t.Radius)
+                    if (t.ControllingGang == null)
+                        continue;
+
+                    try
                     {
-                        Color = t.ControllingGang.BlipColor
-                    };
-                    _blips[t] = blip;
+                        Blip blip = new Blip(t.Center, t.Radius)
+                        {
+                            Color = t.ControllingGang.BlipColor
+                        };
+                        _blips[t] = blip;
+                    }
+                    catch { /* a blip failure must never break the menu */ }
                 }
 
                 UpdateBlips();
@@ -218,13 +346,15 @@ namespace DynamicHostileTerritories.UI
                     continue;
 
                 // Recolour to the current owner so a conquest repaints the turf live.
-                blip.Color = t.ControllingGang.BlipColor;
+                if (t.ControllingGang != null)
+                    blip.Color = t.ControllingGang.BlipColor;
 
                 // Bold when the gang's grip is strong, faint once you've pacified it.
                 blip.Alpha = 0.15f + (t.Strength / 100f) * 0.5f;
 
+                string owner = t.ControllingGang != null ? t.ControllingGang.Name : "Unknown";
                 string state = IsPacified(t) ? "PACIFIED" : (int)t.Strength + "% grip";
-                blip.Name = t.Name + " (" + t.ControllingGang.Name + ") — " + state;
+                blip.Name = t.Name + " (" + owner + ") - " + state;
             }
         }
 
@@ -252,6 +382,8 @@ namespace DynamicHostileTerritories.UI
                 _menu.Visible = false;
             if (_controlMenu != null)
                 _controlMenu.Visible = false;
+            if (_intelMenu != null)
+                _intelMenu.Visible = false;
 
             DeleteBlips();
         }
